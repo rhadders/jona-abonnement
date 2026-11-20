@@ -1,14 +1,14 @@
 import { faalt, type Mislukt } from "./fouten.js";
-import { leesKoppelcode, maakKoppelcode } from "./koppelcode.js";
+import { hashKoppelcode, nieuweKoppelcode, normaliseerKoppelcode } from "./koppelcode.js";
 import { abonnementUitMelding, klopHandtekening } from "./meldingen.js";
-import type { Plan } from "./namen.js";
+import { appNaam, type Plan } from "./namen.js";
 import { bepaalStand, MET_TOEGANG, type Rij, type Stand } from "./stand.js";
 import { maakStripe, type StripeAbonnement, type StripeInstelling } from "./stripe.js";
 
 /**
  * Het abonnement van een organisatie op een app van Jona, van begin tot eind:
- * de stand, kiezen, het klantportaal, meldingen van Stripe, de nacht en het
- * koppelen aan een bestaande klant.
+ * de stand, kiezen, het klantportaal, opzeggen, meldingen van Stripe, de nacht
+ * en het koppelen aan een bestaande klant.
  *
  * Het pakket kent geen database. De app levert een kleine opslag aan bovenop
  * haar eigen tabel `abonnementen` en haar eigen rijbeveiliging.
@@ -29,7 +29,7 @@ export type Bewerking = {
   /** Zet de velden in de rij; maakt de rij aan als hij er nog niet is. */
   schrijf(velden: Schrijfvelden): Promise<void>;
   /** Een regel in het auditlog van de organisatie. Mag niets doen als de app dat hier niet bijhoudt. */
-  log(actie: string): Promise<void>;
+  log(actie: string, details?: Record<string, unknown>): Promise<void>;
 };
 
 /**
@@ -44,23 +44,25 @@ export type Opslag = {
   bewerk<T>(organisatieId: string, namens: string, fn: (bewerking: Bewerking) => Promise<T>): Promise<T>;
 };
 
-export type Koppelmail = { organisatieId: string; namens: string; organisatieNaam: string | null; email: string; adres: string };
-
 export type Instelling = StripeInstelling & {
   opslag: Opslag;
-  /** Is e-mail ingesteld? Zonder e-mail kan koppelen niet. */
-  mailIngesteld?: () => boolean;
-  /** Stuurt de link om te koppelen naar het adres zelf. Geeft terug of de mail is verstuurd (of klaargezet). */
-  stuurKoppelmail?: (mail: Koppelmail) => Promise<boolean>;
   /** Het logboek van de app. Zonder gaat het naar `console.error`. */
   logFout?: (bericht: string, details: Record<string, string>) => void | Promise<void>;
 };
 
 export type Adres = { ok: true; adres: string } | Mislukt;
-export type KoppelUitkomst = { ok: true } | Mislukt;
+export type Gelukt = { ok: true } | Mislukt;
+/** Of er een geldige koppelcode is bij de klant van een organisatie, en tot wanneer. */
+export type CodeStand = { tot: Date } | null;
+/** De klant bij een ingevulde code. `app` is de naam van de app waar de code is gemaakt. */
+export type GevondenKlant = { ok: true; klantId: string; naam: string | null; email: string | null; app: string } | Mislukt;
 export type MeldingUitkomst = "verwerkt" | "genegeerd" | "geweigerd" | "later";
 
 const UUR = 3600_000;
+/** Een koppelcode is 7 dagen geldig. */
+const CODE_GELDIG = 7 * 24 * UUR;
+/** Hooguit zoveel verkeerde codes per uur per organisatie. */
+const POGINGEN = 5;
 /** Een melding van Stripe is klein; een groot verzoek is niet van Stripe. */
 const MAX_MELDING = 500_000;
 
@@ -187,6 +189,15 @@ export function maakAbonnement(instelling: Instelling) {
     return (await legVast(abonnement.waarde, organisatieId)) === "vastgelegd";
   }
 
+  /** Haalt het abonnement van de organisatie opnieuw op bij Stripe, bijvoorbeeld na opzeggen. */
+  async function ververs(organisatieId: string, namens: string = SYSTEEM): Promise<void> {
+    if (!aan()) return;
+    const rij = await opslag.leesRij(organisatieId, namens);
+    if (!rij?.stripeAbonnementId) return;
+    const abonnement = await stripe.haalStripeAbonnement(rij.stripeAbonnementId);
+    if (abonnement.ok) await legVast(abonnement.waarde, organisatieId, namens);
+  }
+
   /* ------------------------------------------------------ afrekenen */
 
   /** Het adres van de betaalpagina van Stripe, of van het klantportaal als er al een lopend abonnement is. */
@@ -232,79 +243,175 @@ export function maakAbonnement(instelling: Instelling) {
     return { ok: true, adres: uitkomst.waarde };
   }
 
-  /* ------------------------------------------------------ koppelen */
+  /* ------------------------------------------------------ opzeggen */
 
-  /*
-   * Een organisatie koppelen aan een klant die al bestaat bij Jona. Wie al een
-   * abonnement heeft op een andere app, kan dit abonnement op dezelfde klant
-   * zetten: één plek voor facturen en betaalwijze.
-   *
-   * Het e-mailadres van een gebruiker is in de app niet bevestigd. Daarom
-   * koppelt de app nooit vanzelf op een gelijk adres: iemand zou zich met het
-   * adres van een ander kunnen aanmelden en dan diens facturen zien. De
-   * gebruiker vraagt een link aan; die gaat naar het adres zelf, en alleen wie
-   * de mail kan lezen en bij deze organisatie is ingelogd, kan bevestigen.
-   */
-
-  const ondertekening = () => stripe.lees("BETTER_AUTH_SECRET") ?? "";
-
-  /** Koppelen kan alleen met abonnementen aan en e-mail ingesteld. */
-  const koppelenKan = () => aan() && Boolean(instelling.stuurKoppelmail) && (instelling.mailIngesteld?.() ?? true);
-
-  /** Wanneer er voor een organisatie het laatst een link is verstuurd; per proces, als rem op herhaald aanvragen. */
-  const laatstVerstuurd = new Map<string, number>();
+  /** Het lopende abonnement van deze organisatie, als dat er is. */
+  async function lopendAbonnement(organisatieId: string, namens: string) {
+    const rij = await opslag.leesRij(organisatieId, namens);
+    if (!rij?.stripeKlantId || !rij.stripeAbonnementId || !rij.status || !MET_TOEGANG.has(rij.status)) return null;
+    return { klantId: rij.stripeKlantId, abonnementId: rij.stripeAbonnementId, opgezegd: rij.stoptOp !== null };
+  }
 
   /**
-   * Stuurt de gebruiker een link om te koppelen, als er bij Jona een klant met
-   * zijn e-mailadres is. Het antwoord is in beide gevallen hetzelfde, zodat
-   * niemand hier kan nagaan of een adres klant is. Hooguit één mail per uur.
+   * Opent bij Stripe het opzeggen van alleen het abonnement van deze
+   * organisatie. In het gewone portaal kan dat niet: de klant kan gedeeld zijn
+   * met andere apps van Jona, en het portaal toont al hun abonnementen.
    */
-  async function vraagKoppelingAan(invoer: { organisatieId: string; namens?: string; organisatieNaam?: string; email: string; herkomst: string }): Promise<KoppelUitkomst> {
-    if (!koppelenKan()) return faalt("koppelen_kan_niet");
+  async function openOpzeggen(invoer: { organisatieId: string; namens?: string; herkomst: string }): Promise<Adres> {
+    const lopend = await lopendAbonnement(invoer.organisatieId, invoer.namens ?? SYSTEEM);
+    if (!lopend) return faalt("geen_lopend_abonnement");
+    if (lopend.opgezegd) return faalt("al_opgezegd");
+    const uitkomst = await stripe.maakOpzegPortaal({ klantId: lopend.klantId, abonnementId: lopend.abonnementId, terugadres: `${invoer.herkomst}/abonnement`, naOpzeggen: `${invoer.herkomst}/abonnement?opgezegd=1` });
+    if (!uitkomst.ok) {
+      await log("Abonnement: opzeggen openen mislukt", { organisatie: invoer.organisatieId, detail: uitkomst.fout });
+      return faalt("opzeggen_mislukt");
+    }
+    return { ok: true, adres: uitkomst.waarde };
+  }
+
+  /** Draait een opzegging terug, zodat het abonnement doorloopt. */
+  async function draaiOpzeggingTerug(invoer: { organisatieId: string; namens?: string }): Promise<Gelukt> {
     const namens = invoer.namens ?? SYSTEEM;
-    const stand = await haalStand(invoer.organisatieId, namens);
-    if (stand.soort !== "proef" && stand.soort !== "verlopen") return faalt("abonnement_loopt");
-    if (stand.klantId) return faalt("organisatie_al_gekoppeld");
-    if (Date.now() - (laatstVerstuurd.get(invoer.organisatieId) ?? 0) < UUR) return { ok: true };
-
-    const klant = await stripe.zoekKlantElders(invoer.email);
-    if (!klant.ok) {
-      await log("Abonnement: klant zoeken mislukt", { organisatie: invoer.organisatieId, detail: klant.fout });
-      return faalt("zoeken_mislukt");
+    const lopend = await lopendAbonnement(invoer.organisatieId, namens);
+    if (!lopend?.opgezegd) return faalt("geen_opzegging");
+    const uitkomst = await stripe.zetOpzeggingTerug(lopend.abonnementId);
+    if (!uitkomst.ok) {
+      await log("Abonnement: opzegging terugdraaien mislukt", { organisatie: invoer.organisatieId, detail: uitkomst.fout });
+      return faalt("terugdraaien_mislukt");
     }
-    const klantId = klant.waarde;
-    if (!klantId) return { ok: true };
-
-    const adres = `${invoer.herkomst}/abonnement/koppelen?code=${encodeURIComponent(maakKoppelcode(ondertekening(), invoer.organisatieId, klantId))}`;
-    let verzonden = false;
-    try {
-      verzonden = await instelling.stuurKoppelmail!({ organisatieId: invoer.organisatieId, namens, organisatieNaam: invoer.organisatieNaam ?? null, email: invoer.email, adres });
-    } catch (fout) {
-      await log("Abonnement: koppelmail mislukt", { organisatie: invoer.organisatieId, detail: fout instanceof Error ? fout.message : "" });
-    }
-    // Ook als versturen mislukt hetzelfde antwoord: een foutmelding zou verraden dat het adres klant is.
-    if (verzonden) laatstVerstuurd.set(invoer.organisatieId, Date.now());
+    await ververs(invoer.organisatieId, namens);
     return { ok: true };
   }
 
-  /** Legt de klant uit de code vast bij de organisatie. Het eerstvolgende abonnement komt dan op die klant. */
-  async function bevestigKoppeling(invoer: { organisatieId: string; namens?: string; code: unknown }): Promise<KoppelUitkomst> {
-    if (!aan()) return faalt("abonnementen_uit");
-    const klantId = leesKoppelcode(ondertekening(), invoer.code, invoer.organisatieId);
-    if (!klantId) return faalt("koppellink_verlopen");
-    return opslag.bewerk(invoer.organisatieId, invoer.namens ?? SYSTEEM, async ({ huidig, schrijf, log: logActie }): Promise<KoppelUitkomst> => {
+  /* ------------------------------------------------------ koppelen */
+
+  /*
+   * Een organisatie koppelen aan een klant die al bestaat bij Jona, met een
+   * koppelcode (zie koppelcode.ts). Het abonnement komt dan op dezelfde
+   * Stripe-klant: één plek voor facturen en betaalwijze, en de bundelkorting.
+   *
+   * Een code is 7 dagen geldig, werkt één keer (koppelen wist hem), en een
+   * nieuwe code of intrekken vervangt de oude. App A is de app waar al een
+   * abonnement loopt en de code wordt gemaakt; app B de app waar hij wordt
+   * ingevuld.
+   */
+
+  /** Koppelen kan zodra abonnementen aanstaan. */
+  const koppelenKan = () => aan();
+
+  /* --- app A */
+
+  /** Of er een geldige code is bij de klant van deze organisatie, voor de kaart. Bij een fout van Stripe: geen code tonen. */
+  async function haalCodeStand(klantId: string, nu = new Date()): Promise<CodeStand> {
+    const klant = await stripe.haalKlant(klantId);
+    if (!klant.ok || !klant.waarde?.hash || !klant.waarde.tot || klant.waarde.tot <= nu) return null;
+    return { tot: klant.waarde.tot };
+  }
+
+  async function eigenKlant(organisatieId: string, namens: string): Promise<{ ok: true; klantId: string } | Mislukt> {
+    if (!koppelenKan()) return faalt("abonnementen_uit");
+    const stand = await haalStand(organisatieId, namens);
+    if (stand.soort !== "abonnement" || !stand.klantId || !MET_TOEGANG.has(stand.status)) return faalt("koppelcode_alleen_met_abonnement");
+    return { ok: true, klantId: stand.klantId };
+  }
+
+  /** Maakt een nieuwe code voor de klant van deze organisatie. De vorige vervalt. De code is alleen nu te zien. */
+  async function maakKoppelcode(invoer: { organisatieId: string; namens?: string }, nu = new Date()): Promise<{ ok: true; code: string; tot: Date } | Mislukt> {
+    const namens = invoer.namens ?? SYSTEEM;
+    const klant = await eigenKlant(invoer.organisatieId, namens);
+    if (!klant.ok) return klant;
+    const code = nieuweKoppelcode();
+    const tot = new Date(nu.getTime() + CODE_GELDIG);
+    const gezet = await stripe.zetKoppelcode(klant.klantId, { hash: hashKoppelcode(normaliseerKoppelcode(code)!), tot });
+    if (!gezet.ok) {
+      await log("Abonnement: koppelcode zetten mislukt", { organisatie: invoer.organisatieId, detail: gezet.fout });
+      return faalt("koppelcode_maken_mislukt");
+    }
+    await opslag.bewerk(invoer.organisatieId, namens, ({ log: logActie }) => logActie("abonnement.koppelcode_gemaakt"));
+    return { ok: true, code, tot };
+  }
+
+  /** Trekt de code van deze organisatie in. */
+  async function trekKoppelcodeIn(invoer: { organisatieId: string; namens?: string }): Promise<Gelukt> {
+    const namens = invoer.namens ?? SYSTEEM;
+    const klant = await eigenKlant(invoer.organisatieId, namens);
+    if (!klant.ok) return klant;
+    const gewist = await stripe.zetKoppelcode(klant.klantId, null);
+    if (!gewist.ok) {
+      await log("Abonnement: koppelcode intrekken mislukt", { organisatie: invoer.organisatieId, detail: gewist.fout });
+      return faalt("koppelcode_intrekken_mislukt");
+    }
+    await opslag.bewerk(invoer.organisatieId, namens, ({ log: logActie }) => logActie("abonnement.koppelcode_ingetrokken"));
+    return { ok: true };
+  }
+
+  /* --- app B */
+
+  /** Verkeerde pogingen per organisatie, per proces: een rem op raden. */
+  const misPogingen = new Map<string, number[]>();
+
+  /** Zoekt de klant bij een ingevulde code, met alle controles. Een verkeerde code telt als poging. */
+  async function zoek(invoer: { organisatieId: string; namens?: string; code: unknown }, nu = Date.now()): Promise<GevondenKlant> {
+    if (!koppelenKan()) return faalt("abonnementen_uit");
+    const stand = await haalStand(invoer.organisatieId, invoer.namens ?? SYSTEEM);
+    if (stand.soort !== "proef" && stand.soort !== "verlopen") return faalt("abonnement_loopt_koppelen");
+    if (stand.klantId) return faalt("organisatie_al_gekoppeld");
+
+    const eerder = (misPogingen.get(invoer.organisatieId) ?? []).filter((t) => t > nu - UUR);
+    if (eerder.length >= POGINGEN) return faalt("koppelcode_te_vaak");
+    const mis = (): GevondenKlant => {
+      misPogingen.set(invoer.organisatieId, [...eerder, nu]);
+      return faalt("koppelcode_ongeldig");
+    };
+
+    const tekens = normaliseerKoppelcode(invoer.code);
+    if (!tekens) return mis();
+    const klant = await stripe.zoekKlantOpKoppelcode(hashKoppelcode(tekens));
+    if (!klant.ok) {
+      await log("Abonnement: koppelcode zoeken mislukt", { organisatie: invoer.organisatieId, detail: klant.fout });
+      return faalt("koppelcode_controleren_mislukt");
+    }
+    const gevonden = klant.waarde;
+    if (!gevonden || !gevonden.tot || gevonden.tot.getTime() <= nu) return mis();
+    if (gevonden.app === instelling.app) return { ...faalt("koppelcode_zelfde_app"), fout: `Deze code is gemaakt in ${instelling.naam}. Gebruik hem in een andere app van Jona.` };
+    return { ok: true, klantId: gevonden.id, naam: gevonden.naam, email: gevonden.email, app: appNaam(gevonden.app) };
+  }
+
+  /** De controlestap: bij welke klant hoort deze code? Er wordt nog niets gekoppeld. */
+  async function controleerKoppelcode(invoer: { organisatieId: string; namens?: string; code: unknown }): Promise<{ ok: true; naam: string | null; app: string } | Mislukt> {
+    const uitkomst = await zoek(invoer);
+    return uitkomst.ok ? { ok: true, naam: uitkomst.naam, app: uitkomst.app } : uitkomst;
+  }
+
+  /**
+   * Koppelt de organisatie aan de klant bij de code. Eerst wordt de code bij
+   * Stripe gewist, zodat hij geen tweede keer werkt; lukt daarna het vastleggen
+   * niet, dan maakt app A een nieuwe code. Geeft de klant terug, zodat de app
+   * de betaler een seintje kan mailen.
+   */
+  async function bevestigKoppeling(invoer: { organisatieId: string; namens?: string; code: unknown }): Promise<GevondenKlant> {
+    const gevonden = await zoek(invoer);
+    if (!gevonden.ok) return gevonden;
+    const klantId = gevonden.klantId;
+    const gewist = await stripe.zetKoppelcode(klantId, null);
+    if (!gewist.ok) {
+      await log("Abonnement: koppelcode wissen mislukt", { organisatie: invoer.organisatieId, detail: gewist.fout });
+      return faalt("koppelen_mislukt");
+    }
+    const vastgelegd = await opslag.bewerk(invoer.organisatieId, invoer.namens ?? SYSTEEM, async ({ huidig, schrijf, log: logActie }): Promise<Gelukt> => {
       if (huidig?.status && MET_TOEGANG.has(huidig.status)) return faalt("abonnement_loopt_koppelen");
       if (huidig?.stripeKlantId && huidig.stripeKlantId !== klantId) return faalt("organisatie_heeft_klant");
       await schrijf({ stripeKlantId: klantId });
-      await logActie("abonnement.klant_gekoppeld");
+      await logActie("abonnement.klant_gekoppeld", { via: "koppelcode" });
       return { ok: true };
     });
+    return vastgelegd.ok ? gevonden : vastgelegd;
   }
 
-  /** Alleen voor tests: vergeet wat er bij Stripe is opgezocht en wanneer er een link is verstuurd. */
+  /** Alleen voor tests: vergeet wat er bij Stripe is opgezocht en de verkeerde pogingen. */
   function vergeet() {
     stripe.vergeetInrichting();
-    laatstVerstuurd.clear();
+    misPogingen.clear();
   }
 
   return {
@@ -319,13 +426,17 @@ export function maakAbonnement(instelling: Instelling) {
     ontvangMelding,
     verwerkTerugkeer,
     werkBij,
+    ververs,
     startAbonnement,
     openPortaal,
+    openOpzeggen,
+    draaiOpzeggingTerug,
     koppelenKan,
-    vraagKoppelingAan,
+    haalCodeStand,
+    maakKoppelcode,
+    trekKoppelcodeIn,
+    controleerKoppelcode,
     bevestigKoppeling,
-    maakKoppelcode: (organisatieId: string, klantId: string, nu?: number) => maakKoppelcode(ondertekening(), organisatieId, klantId, nu),
-    leesKoppelcode: (code: unknown, organisatieId: string, nu?: number) => leesKoppelcode(ondertekening(), code, organisatieId, nu),
     vergeet,
   };
 }

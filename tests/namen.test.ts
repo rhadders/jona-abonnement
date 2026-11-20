@@ -1,13 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { BUNDEL_COUPON, namenVan, STRIPE_VERSIE } from "../src/index.js";
+import { BUNDEL_COUPON, KOPPEL, namenVan, STRIPE_VERSIE } from "../src/index.js";
 
 /**
  * De namentest. Elke naam hieronder staat zo bij Stripe, of stond letterlijk
  * zo in de code van de app voordat het pakket er was. Een app vindt haar
- * product, prijzen, btw-tarief en portaal op deze namen terug; verandert er
+ * product, prijzen, btw-tarief en portalen op deze namen terug; verandert er
  * één teken, dan maakt zij ze opnieuw aan en staan ze dubbel.
  *
- * Deze test mag alleen veranderen als er een app bij komt.
+ * Deze test mag alleen veranderen als er een app bij komt, of als alle apps
+ * samen bewust een nieuwe instelling bij Stripe nemen (zoals portaal-2, toen
+ * opzeggen uit het gewone portaal ging).
  */
 describe("de namen bij Stripe", () => {
   it("Jona Giften", () => {
@@ -19,7 +21,7 @@ describe("de namen bij Stripe", () => {
         maand: { lookupKey: "jona_giften_maand", centen: 1295, interval: "month", naam: "Jona Giften per maand", eenmalig: "jona-giften-prijs-jona_giften_maand-1295" },
       },
       eenmaligBtw: "jona-giften-btw-21",
-      eenmaligPortaal: "jona-giften-portaal-1",
+      portalen: { algemeen: { sleutel: "portaal-2", eenmalig: "jona-giften-portaal-2" }, opzeggen: { sleutel: "opzeggen-1", eenmalig: "jona-giften-opzeggen-1" } },
     });
   });
 
@@ -32,12 +34,16 @@ describe("de namen bij Stripe", () => {
         maand: { lookupKey: "jona_bestuur_maand", centen: 1295, interval: "month", naam: "Jona Bestuur per maand", eenmalig: "jona-bestuur-prijs-jona_bestuur_maand-1295" },
       },
       eenmaligBtw: "jona-bestuur-btw-21",
-      eenmaligPortaal: "jona-bestuur-portaal-1",
+      portalen: { algemeen: { sleutel: "portaal-2", eenmalig: "jona-bestuur-portaal-2" }, opzeggen: { sleutel: "opzeggen-1", eenmalig: "jona-bestuur-opzeggen-1" } },
     });
   });
 
   it("de coupon van de bundelkorting is van alle apps samen", () => {
     expect(BUNDEL_COUPON).toBe("jona_bundel_15");
+  });
+
+  it("de koppelcode staat bij elke app onder dezelfde sleutels bij de klant", () => {
+    expect(KOPPEL).toEqual({ code: "jona_koppelcode", tot: "jona_koppelcode_tot", app: "jona_koppelcode_app" });
   });
 
   it("de versie van de Stripe-API", () => {

@@ -1,6 +1,6 @@
 {
   "name": "@jona/abonnement",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Het abonnement van een organisatie op een app van Jona: Stripe, proefperiode, bundelkorting en koppelen aan een bestaande klant.",
   "license": "UNLICENSED",
   "private": true,

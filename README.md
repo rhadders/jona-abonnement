@@ -3,7 +3,8 @@
 Het abonnement van een organisatie op een app van Jona, op één plek. Elke app
 van Jona (Jona Giften, Jona Bestuur) gebruikt dit pakket, zodat de regels
 overal gelijk zijn: 14 dagen proef, per jaar of per maand, het klantportaal
-van Stripe, koppelen aan een bestaande klant en 15% bundelkorting.
+van Stripe, opzeggen, koppelen aan een bestaande klant met een koppelcode en
+15% bundelkorting.
 
 Het is een pakket, geen dienst. Elke app praat zelf met Stripe en bewaart zelf
 de stand in haar eigen tabel `abonnementen`. Het pakket kent geen database,
@@ -15,12 +16,13 @@ geen Next.js en geen React.
   btw), het btw-tarief van 21% en de instellingen van het klantportaal maakt
   het pakket aan als ze ontbreken, en vindt ze daarna terug op een vaste naam.
   De betaalpagina (Checkout), het klantportaal, een abonnement ophalen.
+- **Opzeggen** van alleen het eigen abonnement, en een opzegging terugdraaien.
 - **De stand**: `bepaalStand()` zegt of een organisatie in de proef zit, een
   abonnement heeft, is vrijgesteld of geen toegang meer heeft.
 - **Meldingen van Stripe**: de handtekening controleren en het abonnement
   daarna zelf ophalen, zodat de volgorde van meldingen er niet toe doet.
 - **Koppelen aan een bestaande klant** bij een andere app van Jona, met een
-  ondertekende link die 24 uur geldt, en de **bundelkorting**.
+  koppelcode die 7 dagen geldt, en de **bundelkorting**.
 - **De vaste waarden** van alle apps samen: de prijzen, `PROEFDAGEN`,
   `MET_TOEGANG`, `BUNDELKORTING` en de versie van de Stripe-API.
 
@@ -43,9 +45,16 @@ geen Next.js en geen React.
 - Alle apps delen één Stripe-account. Een app telt alleen abonnementen op haar
   eigen product en negeert meldingen over andere apps, ook als de organisatie
   in de metadata bij haar bestaat.
-- Koppelen gaat nooit vanzelf op een gelijk e-mailadres: het adres in de app
-  is niet bevestigd. De link gaat naar het adres zelf, en het antwoord op het
-  scherm is hetzelfde of er een klant is of niet. Hooguit één mail per uur.
+- De klant bij Stripe kan gedeeld zijn met een andere app van Jona, en het
+  klantportaal toont alle abonnementen van die klant. In het gewone portaal
+  kan daarom niemand opzeggen. Opzeggen gaat met een eigen knop, die Stripe
+  opent voor alleen het abonnement van deze organisatie.
+- Koppelen gaat met een koppelcode, niet op e-mailadres: de klant is de
+  organisatie, niet de persoon. Een beheerder met een lopend abonnement maakt
+  in de ene app een code (`JONA-XXXX-XXXX-XXXX`, 7 dagen geldig, eenmalig,
+  intrekbaar); een beheerder in de andere app vult hem in. Bij Stripe staat
+  alleen de hash van de code, in de metadata van de klant. Hooguit 5 verkeerde
+  codes per uur per organisatie.
 - Zonder `ABONNEMENT_STRIPE_SECRET_KEY` staan abonnementen uit en heeft
   iedereen toegang.
 
@@ -58,6 +67,8 @@ Uit het korte woord van de app (`giften`, `bestuur`) volgt alles:
 | Product | `jona_<app>_abonnement` |
 | Prijzen (lookup keys) | `jona_<app>_jaar`, `jona_<app>_maand` |
 | Metadata van het btw-tarief en het portaal | `jona_<app>` |
+| De twee instellingen van het portaal | `portaal-2` (facturen en betaalwijze) en `opzeggen-1`, in die metadata |
+| De koppelcode bij de klant | metadata `jona_koppelcode` (hash), `jona_koppelcode_tot`, `jona_koppelcode_app` |
 
 Aan het voorvoegsel `jona_` herkennen de apps elkaars abonnementen. Deze namen
 veranderen niet: een app die haar product of prijs niet terugvindt, maakt ze
@@ -88,7 +99,7 @@ const opslag: Opslag = {
       fn({
         huidig: /* de rij, of null */,
         schrijf: async (velden) => { /* insert ... on conflict do update, met bijgewerkt_op */ },
-        log: async (actie) => { /* een regel in het auditlog, of niets */ },
+        log: async (actie, details) => { /* een regel in het auditlog, of niets */ },
       }),
     ),
 };
@@ -98,8 +109,6 @@ export const abonnement = maakAbonnement({
   naam: "Jona Bestuur",
   omschrijving: "Vergaderen, notuleren en besluiten voor besturen",
   opslag,
-  mailIngesteld,
-  stuurKoppelmail: async ({ organisatieId, namens, email, adres }) => { /* de mail met de link; true als hij is verstuurd of klaargezet */ },
   logFout,
 });
 ```
@@ -114,7 +123,9 @@ Daarna:
 | Terug uit de betaalpagina (`?sessie=`) | `abonnement.verwerkTerugkeer({ ... })` |
 | De route `/api/abonnement/stripe` | `export const POST = (verzoek: Request) => abonnement.ontvangMelding(verzoek)` |
 | De nachtelijke taak | `abonnement.werkBij(organisatieId)` per organisatie |
-| "Al klant bij Jona?" | `abonnement.vraagKoppelingAan({ ... })` en `abonnement.bevestigKoppeling({ ... })` |
+| "Opzeggen" en "Toch doorgaan" | `abonnement.openOpzeggen({ ... })` en `abonnement.draaiOpzeggingTerug({ ... })`; na `?opgezegd=1` eerst `abonnement.ververs(...)` |
+| Een koppelcode maken of intrekken (met een lopend abonnement) | `abonnement.maakKoppelcode({ ... })`, `abonnement.trekKoppelcodeIn({ ... })`, `abonnement.haalCodeStand(klantId)` |
+| Een koppelcode invullen (zonder abonnement) | `abonnement.controleerKoppelcode({ ... })` en `abonnement.bevestigKoppeling({ ... })`; die geeft de klant terug, zodat de app de betaler kan mailen |
 | Het dashboard | `bepaalStand()` voor proef, abonnement, verlopen en vrijgesteld |
 
 De rij heeft deze kolommen: `stripe_klant_id`, `stripe_abonnement_id`, `plan`
@@ -136,12 +147,12 @@ Het pakket leest deze variabelen bij elk gebruik uit `process.env` (of uit
 | `ABONNEMENT_STRIPE_SECRET_KEY` | de geheime sleutel van het Stripe-account van Jona; zonder staan abonnementen uit |
 | `ABONNEMENT_STRIPE_WEBHOOK_SECRET` | het geheim (`whsec_...`) van het meldadres van deze app |
 | `ABONNEMENT_BTW` | `uit` laat het btw-tarief van 21% weg (als Stripe Tax de btw berekent) |
-| `BETTER_AUTH_SECRET` | ondertekent de koppelcode |
 | `STRIPE_API_URL` | alleen voor tests: een nagemaakt Stripe |
 
 Een beperkte sleutel moet dit kunnen: producten, prijzen, btw-tarieven,
 portaalinstellingen en coupons lezen en aanmaken, betaalsessies en
-portaalsessies aanmaken, en klanten en abonnementen lezen.
+portaalsessies aanmaken, klanten lezen, zoeken en bijwerken (de metadata met de
+koppelcode), en abonnementen lezen en bijwerken (een opzegging terugdraaien).
 
 ### Meldadres bij Stripe
 
@@ -158,7 +169,7 @@ Bij elke versie hangt het ingepakte pakket aan de release. De app wijst
 daarnaar, met een exacte versie:
 
 ```json
-"@jona/abonnement": "https://github.com/rhadders/jona-abonnement/releases/download/v1.0.0/jona-abonnement-1.0.0.tgz"
+"@jona/abonnement": "https://github.com/rhadders/jona-abonnement/releases/download/v2.0.0/jona-abonnement-2.0.0.tgz"
 ```
 
 `package-lock.json` legt de controlesom vast. Er is geen sleutel en geen git
@@ -198,10 +209,10 @@ letters.
 
 ```
 src/namen.ts        de namen bij Stripe, de prijzen, de bundelkorting
-src/stripe.ts       Stripe: inrichting, betaalpagina, portaal, abonnement, klant elders
+src/stripe.ts       Stripe: inrichting, betaalpagina, portalen, opzeggen, abonnement, klant met koppelcode
 src/stand.ts        de stand bepalen
 src/meldingen.ts    handtekening van een melding, het abonnement uit een melding
-src/koppelcode.ts   de ondertekende code in de koppellink
+src/koppelcode.ts   de koppelcode: maken, lezen wat iemand invult, de hash
 src/fouten.ts       de meldingen met hun code
 src/abonnement.ts   de stromen, tegen de opslag van de app
 tests/              de namentest, de zuivere tests en de stromen tegen een nagemaakt Stripe

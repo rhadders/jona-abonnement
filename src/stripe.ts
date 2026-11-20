@@ -1,6 +1,6 @@
 import { faalt, type Foutcode } from "./fouten.js";
 import { isAbonnementId, isKlantId, isSessieId, object, tekst, type Rauw } from "./meldingen.js";
-import { BUNDEL_COUPON, BUNDELKORTING, JONA_VOORVOEGSEL, namenVan, PLANNEN, type Namen, type Plan } from "./namen.js";
+import { BUNDEL_COUPON, BUNDELKORTING, JONA_VOORVOEGSEL, KOPPEL, namenVan, PLANNEN, type Namen, type Plan, type Portaalsoort } from "./namen.js";
 
 /**
  * Stripe voor het abonnement van organisaties op een app van Jona. Het is het
@@ -60,6 +60,9 @@ export type Afrekening = {
   terugadres: string;
   stopadres: string;
 };
+
+/** Een klant bij Stripe, met de koppelcode uit zijn metadata. */
+export type KlantMetCode = { id: string; naam: string | null; email: string | null; hash: string | null; tot: Date | null; app: string | null };
 
 type Velden = [string, string][];
 type Inrichting = { prijzen: Record<Plan, string>; btw: string | null };
@@ -121,12 +124,12 @@ export function maakStripe(instelling: StripeInstelling) {
   /* ------------------------------------------------- inrichting bij Stripe */
 
   let inrichting: Promise<Antwoord<Inrichting>> | null = null;
-  let portaal: Promise<Antwoord<string>> | null = null;
+  const portalen: Partial<Record<Portaalsoort, Promise<Antwoord<string>>>> = {};
 
   /** Alleen voor tests: vergeet wat er bij Stripe is opgezocht. */
   function vergeetInrichting() {
     inrichting = null;
-    portaal = null;
+    for (const soort of Object.keys(portalen) as Portaalsoort[]) delete portalen[soort];
   }
 
   /** Het product, de twee prijzen (inclusief btw) en het btw-tarief. Maakt aan wat ontbreekt. */
@@ -222,48 +225,111 @@ export function maakStripe(instelling: StripeInstelling) {
     return { ok: true, waarde: tekst(nieuw.waarde.id) };
   }
 
-  /** De instellingen van het klantportaal: facturen, betaalwijze, wisselen tussen jaar en maand, opzeggen per einde periode. */
-  function zorgVoorPortaal(prijzen: Record<Plan, string>): Promise<Antwoord<string>> {
-    if (!portaal) {
-      portaal = richtPortaalIn(prijzen).then((uitkomst) => {
-        if (!uitkomst.ok) portaal = null;
+  /*
+   * Twee instellingen voor het klantportaal. De klant bij Stripe kan gedeeld
+   * zijn met andere apps van Jona (zie koppelcode.ts), en het portaal toont
+   * alle abonnementen van de klant. Daarom kan in het gewone portaal niemand
+   * opzeggen: alleen facturen, betaalwijze, klantgegevens en wisselen tussen
+   * jaar en maand (en dat alleen voor het product van deze app).
+   *
+   * Opzeggen gaat met een eigen knop in de app. Die opent het portaal met de
+   * tweede instelling, in de flow `subscription_cancel` voor alleen het
+   * abonnement van deze organisatie. Een flow verbergt de rest van het
+   * portaal, en na het opzeggen gaat de klant meteen terug naar de app.
+   */
+  function zorgVoorPortaal(soort: Portaalsoort, prijzen: Record<Plan, string>): Promise<Antwoord<string>> {
+    if (!portalen[soort]) {
+      portalen[soort] = richtPortaalIn(soort, prijzen).then((uitkomst) => {
+        if (!uitkomst.ok) delete portalen[soort];
         return uitkomst;
       });
     }
-    return portaal;
+    return portalen[soort]!;
   }
 
-  async function richtPortaalIn(prijzen: Record<Plan, string>): Promise<Antwoord<string>> {
+  async function richtPortaalIn(soort: Portaalsoort, prijzen: Record<Plan, string>): Promise<Antwoord<string>> {
+    const { sleutel, eenmalig } = namen.portalen[soort];
     const bestaand = await vraag("billing_portal/configurations?active=true&limit=100");
     if (!bestaand.ok) return bestaand;
-    const gevonden = lijst(bestaand.waarde).find((c) => object(c.metadata)?.[namen.metadata] === "abonnement");
+    const gevonden = lijst(bestaand.waarde).find((c) => object(c.metadata)?.[namen.metadata] === sleutel);
     if (gevonden && tekst(gevonden.id)) return { ok: true, waarde: tekst(gevonden.id)! };
-    const nieuw = await vraag("billing_portal/configurations", {
-      methode: "POST",
-      eenmalig: namen.eenmaligPortaal,
-      velden: [
-        ["business_profile[headline]", `${instelling.naam}: uw abonnement`],
-        ["features[invoice_history][enabled]", "true"],
-        ["features[payment_method_update][enabled]", "true"],
-        ["features[customer_update][enabled]", "true"],
-        ["features[customer_update][allowed_updates][0]", "name"],
-        ["features[customer_update][allowed_updates][1]", "email"],
-        ["features[customer_update][allowed_updates][2]", "address"],
-        ["features[customer_update][allowed_updates][3]", "tax_id"],
-        ["features[subscription_cancel][enabled]", "true"],
-        ["features[subscription_cancel][mode]", "at_period_end"],
-        ["features[subscription_update][enabled]", "true"],
-        ["features[subscription_update][default_allowed_updates][0]", "price"],
-        ["features[subscription_update][proration_behavior]", "create_prorations"],
-        ["features[subscription_update][products][0][product]", namen.product],
-        ["features[subscription_update][products][0][prices][0]", prijzen.jaar],
-        ["features[subscription_update][products][0][prices][1]", prijzen.maand],
-        [`metadata[${namen.metadata}]`, "abonnement"],
-      ],
-    });
+    const velden: Velden =
+      soort === "algemeen"
+        ? [
+            ["business_profile[headline]", `${instelling.naam}: facturen en betaalwijze`],
+            ["features[invoice_history][enabled]", "true"],
+            ["features[payment_method_update][enabled]", "true"],
+            ["features[customer_update][enabled]", "true"],
+            ["features[customer_update][allowed_updates][0]", "name"],
+            ["features[customer_update][allowed_updates][1]", "email"],
+            ["features[customer_update][allowed_updates][2]", "address"],
+            ["features[customer_update][allowed_updates][3]", "tax_id"],
+            ["features[subscription_cancel][enabled]", "false"],
+            ["features[subscription_update][enabled]", "true"],
+            ["features[subscription_update][default_allowed_updates][0]", "price"],
+            ["features[subscription_update][proration_behavior]", "create_prorations"],
+            ["features[subscription_update][products][0][product]", namen.product],
+            ["features[subscription_update][products][0][prices][0]", prijzen.jaar],
+            ["features[subscription_update][products][0][prices][1]", prijzen.maand],
+          ]
+        : [
+            ["business_profile[headline]", `${instelling.naam}: abonnement opzeggen`],
+            ["features[invoice_history][enabled]", "false"],
+            ["features[payment_method_update][enabled]", "false"],
+            ["features[customer_update][enabled]", "false"],
+            ["features[subscription_update][enabled]", "false"],
+            ["features[subscription_cancel][enabled]", "true"],
+            ["features[subscription_cancel][mode]", "at_period_end"],
+          ];
+    const nieuw = await vraag("billing_portal/configurations", { methode: "POST", eenmalig, velden: [...velden, [`metadata[${namen.metadata}]`, sleutel]] });
     if (!nieuw.ok) return nieuw;
     const id = tekst(nieuw.waarde.id);
     return id ? { ok: true, waarde: id } : mislukt(0, "stripe_geen_portaal");
+  }
+
+  async function portaalSessie(soort: Portaalsoort, velden: Velden): Promise<Antwoord<string>> {
+    const ingericht = await zorgVoorInrichting();
+    if (!ingericht.ok) return ingericht;
+    const configuratie = await zorgVoorPortaal(soort, ingericht.waarde.prijzen);
+    if (!configuratie.ok) return configuratie;
+    const antwoord = await vraag("billing_portal/sessions", { methode: "POST", velden: [...velden, ["configuration", configuratie.waarde], ["locale", "nl"]] });
+    if (!antwoord.ok) return antwoord;
+    const url = tekst(antwoord.waarde.url);
+    return url && /^https:\/\//.test(url) ? { ok: true, waarde: url } : mislukt(0, "stripe_geen_portaal");
+  }
+
+  /** Het klantportaal van Stripe: facturen, betaalwijze en wisselen tussen jaar en maand. Opzeggen kan hier niet. */
+  function maakPortaal(klantId: string, terugadres: string): Promise<Antwoord<string>> {
+    return portaalSessie("algemeen", [
+      ["customer", klantId],
+      ["return_url", terugadres],
+    ]);
+  }
+
+  /** Het portaal in de flow voor opzeggen, voor alleen dit abonnement. Na het opzeggen gaat de klant naar `naOpzeggen`. */
+  function maakOpzegPortaal(invoer: { klantId: string; abonnementId: string; terugadres: string; naOpzeggen: string }): Promise<Antwoord<string>> {
+    return portaalSessie("opzeggen", [
+      ["customer", invoer.klantId],
+      ["return_url", invoer.terugadres],
+      ["flow_data[type]", "subscription_cancel"],
+      ["flow_data[subscription_cancel][subscription]", invoer.abonnementId],
+      ["flow_data[after_completion][type]", "redirect"],
+      ["flow_data[after_completion][redirect][return_url]", invoer.naOpzeggen],
+    ]);
+  }
+
+  /**
+   * Draait een opzegging terug: het abonnement loopt dan gewoon door. Stripe
+   * legt een opzegging per einde periode vast als `cancel_at_period_end` of
+   * (sinds 2025) als `cancel_at`; beide worden gewist.
+   */
+  async function zetOpzeggingTerug(abonnementId: string): Promise<Antwoord<true>> {
+    if (!isAbonnementId(abonnementId)) return mislukt(404, "abonnement_onbekend");
+    const eerst = await vraag(`subscriptions/${abonnementId}`, { methode: "POST", velden: [["cancel_at_period_end", "false"]] });
+    if (!eerst.ok) return eerst;
+    if (eerst.waarde.cancel_at === null || eerst.waarde.cancel_at === undefined) return { ok: true, waarde: true };
+    const daarna = await vraag(`subscriptions/${abonnementId}`, { methode: "POST", velden: [["cancel_at", ""]] });
+    return daarna.ok ? { ok: true, waarde: true } : daarna;
   }
 
   /* ------------------------------------------------------ afrekenen */
@@ -305,26 +371,6 @@ export function maakStripe(instelling: StripeInstelling) {
     if (!antwoord.ok) return antwoord;
     const url = tekst(antwoord.waarde.url);
     return url && /^https:\/\//.test(url) ? { ok: true, waarde: url } : mislukt(0, "stripe_geen_betaalpagina");
-  }
-
-  /** Het klantportaal van Stripe, waar de organisatie facturen ziet, wisselt van plan of opzegt. */
-  async function maakPortaal(klantId: string, terugadres: string): Promise<Antwoord<string>> {
-    const ingericht = await zorgVoorInrichting();
-    if (!ingericht.ok) return ingericht;
-    const configuratie = await zorgVoorPortaal(ingericht.waarde.prijzen);
-    if (!configuratie.ok) return configuratie;
-    const antwoord = await vraag("billing_portal/sessions", {
-      methode: "POST",
-      velden: [
-        ["customer", klantId],
-        ["return_url", terugadres],
-        ["configuration", configuratie.waarde],
-        ["locale", "nl"],
-      ],
-    });
-    if (!antwoord.ok) return antwoord;
-    const url = tekst(antwoord.waarde.url);
-    return url && /^https:\/\//.test(url) ? { ok: true, waarde: url } : mislukt(0, "stripe_geen_portaal");
   }
 
   /* ------------------------------------------------------ de stand */
@@ -415,31 +461,61 @@ export function maakStripe(instelling: StripeInstelling) {
     return opnieuw.ok ? { ok: true, waarde: BUNDEL_COUPON } : nieuw;
   }
 
+  /* ---------------------------------------------------- koppelcodes */
+
+  function klantMetCode(klant: Rauw): KlantMetCode | null {
+    if (!isKlantId(klant.id) || klant.deleted === true) return null;
+    const metadata = object(klant.metadata) ?? {};
+    const hash = tekst(metadata[KOPPEL.code]);
+    const tot = Number(tekst(metadata[KOPPEL.tot]));
+    return {
+      id: klant.id,
+      naam: tekst(klant.name),
+      email: tekst(klant.email),
+      hash: hash && /^[0-9a-f]{64}$/.test(hash) ? hash : null,
+      tot: Number.isFinite(tot) && tot > 0 ? new Date(tot * 1000) : null,
+      app: tekst(metadata[KOPPEL.app]),
+    };
+  }
+
+  /** Een klant met de koppelcode in zijn metadata; `null` als hij niet bestaat of is verwijderd. */
+  async function haalKlant(klantId: string): Promise<Antwoord<KlantMetCode | null>> {
+    if (!isKlantId(klantId)) return { ok: true, waarde: null };
+    const antwoord = await vraag(`customers/${klantId}`);
+    if (!antwoord.ok) return antwoord.status === 404 ? { ok: true, waarde: null } : antwoord;
+    return { ok: true, waarde: klantMetCode(antwoord.waarde) };
+  }
+
+  /** Zet een koppelcode (als hash) bij de klant, of wist hem met `null`. Een lege waarde wist een sleutel bij Stripe. */
+  async function zetKoppelcode(klantId: string, code: { hash: string; tot: Date } | null): Promise<Antwoord<true>> {
+    const antwoord = await vraag(`customers/${klantId}`, {
+      methode: "POST",
+      velden: [
+        [`metadata[${KOPPEL.code}]`, code?.hash ?? ""],
+        [`metadata[${KOPPEL.tot}]`, code ? String(Math.floor(code.tot.getTime() / 1000)) : ""],
+        [`metadata[${KOPPEL.app}]`, code ? instelling.app : ""],
+      ],
+    });
+    return antwoord.ok ? { ok: true, waarde: true } : antwoord;
+  }
+
   /**
-   * Zoekt een klant met dit e-mailadres die al een lopend abonnement heeft op
-   * een andere app van Jona in hetzelfde Stripe-account (een product dat met
-   * `jona_` begint en niet dat van deze app is). Zo'n klant kan ook dit
-   * abonnement dragen: één plek voor facturen en betaalwijze.
-   *
-   * Het e-mailadres in de app is niet bevestigd. Wie hier een klant vindt, mag
-   * die dus nooit zomaar gebruiken: eerst de bevestiging per e-mail.
+   * De klant bij de hash van een koppelcode, via de zoekfunctie van Stripe. Die
+   * loopt iets achter (meestal minder dan een minuut), dus elke gevonden klant
+   * wordt daarna nog direct opgehaald en opnieuw gecontroleerd.
    */
-  async function zoekKlantElders(email: string): Promise<Antwoord<string | null>> {
-    const adres = email.trim().toLowerCase();
-    if (!adres) return { ok: true, waarde: null };
-    const vraagtekst = new URLSearchParams([
-      ["email", adres],
-      ["limit", "10"],
-      ["expand[]", "data.subscriptions"],
-    ]).toString();
-    const antwoord = await vraag(`customers?${vraagtekst}`);
+  async function zoekKlantOpKoppelcode(hash: string): Promise<Antwoord<KlantMetCode | null>> {
+    if (!/^[0-9a-f]{64}$/.test(hash)) return { ok: true, waarde: null };
+    const antwoord = await vraag(`customers/search?${new URLSearchParams([["query", `metadata['${KOPPEL.code}']:'${hash}'`], ["limit", "10"]]).toString()}`);
     if (!antwoord.ok) return antwoord;
-    for (const klant of lijst(antwoord.waarde)) {
-      if (!isKlantId(klant.id) || klant.deleted === true) continue;
-      if (looptElders(lijst(klant.subscriptions))) return { ok: true, waarde: klant.id };
+    for (const gevonden of lijst(antwoord.waarde)) {
+      if (!isKlantId(gevonden.id)) continue;
+      const klant = await haalKlant(gevonden.id);
+      if (!klant.ok) return klant;
+      if (klant.waarde?.hash === hash) return klant;
     }
     return { ok: true, waarde: null };
   }
 
-  return { namen, sleutel, lees, vergeetInrichting, zorgVoorInrichting, maakAfrekening, maakPortaal, haalStripeAbonnement, haalAfrekening, klantLooptElders, zoekKlantElders };
+  return { namen, sleutel, lees, vergeetInrichting, zorgVoorInrichting, maakAfrekening, maakPortaal, maakOpzegPortaal, zetOpzeggingTerug, haalStripeAbonnement, haalAfrekening, klantLooptElders, haalKlant, zetKoppelcode, zoekKlantOpKoppelcode };
 }
