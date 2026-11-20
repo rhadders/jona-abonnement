@@ -1,0 +1,36 @@
+# Een tag v1.2.3 maakt een release met het ingepakte pakket eraan. De apps
+# wijzen in package.json naar dat bestand; zie README (Een nieuwe versie).
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: De tag hoort bij de versie in package.json
+        run: |
+          versie="v$(node -p "require('./package.json').version")"
+          if [ "$versie" != "$GITHUB_REF_NAME" ]; then
+            echo "De tag is $GITHUB_REF_NAME, maar in package.json staat $versie."
+            exit 1
+          fi
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run pakket
+      - name: Release met het pakket
+        run: gh release create "$GITHUB_REF_NAME" jona-abonnement-*.tgz --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
