@@ -1,0 +1,131 @@
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+
+/**
+ * Een nagebootst Stripe: net genoeg om de inrichting, de betaalpagina, het
+ * portaal, abonnementen, klanten en de coupon te testen. Alle gegevens zijn
+ * verzonnen.
+ */
+
+export type NepAbonnement = { id: string; status: string; organisatie: string; klant: string; interval: "year" | "month"; trialEnd: number | null; periodeEind: number; cancelAtPeriodEnd: boolean; product?: string };
+
+export function maakNepStripe(app: string) {
+  const product = `jona_${app}_abonnement`;
+  const stand = {
+    prijzen: new Map<string, { id: string; lookup_key: string; unit_amount: number; interval: string; tax_behavior: string }>(),
+    product: null as URLSearchParams | null,
+    btw: [] as string[],
+    portalen: [] as URLSearchParams[],
+    sessies: [] as URLSearchParams[],
+    abonnementen: new Map<string, NepAbonnement>(),
+    afrekeningen: new Map<string, { client_reference_id: string; subscription: string }>(),
+    verzoeken: [] as string[],
+    eenmalig: [] as string[],
+    sleutels: new Set<string>(),
+    versies: new Set<string>(),
+    klanten: [] as { id: string; email: string; abonnementen: { status: string; product: string }[] }[],
+    coupons: new Set<string>(),
+    couponsGemaakt: 0,
+  };
+
+  const abonnementJson = (a: NepAbonnement) => ({
+    id: a.id,
+    object: "subscription",
+    status: a.status,
+    livemode: false,
+    customer: a.klant,
+    metadata: { organisatie_id: a.organisatie },
+    trial_end: a.trialEnd,
+    cancel_at_period_end: a.cancelAtPeriodEnd,
+    cancel_at: null,
+    ended_at: a.status === "canceled" ? Math.floor(Date.now() / 1000) : null,
+    items: { data: [{ current_period_end: a.periodeEind, price: { product: a.product ?? product, lookup_key: a.product ? null : a.interval === "year" ? `jona_${app}_jaar` : `jona_${app}_maand`, recurring: { interval: a.interval } } }] },
+  });
+
+  const server: Server = createServer((verzoek, antwoord) => {
+    let inhoud = "";
+    verzoek.on("data", (deel) => (inhoud += deel));
+    verzoek.on("end", () => {
+      const url = new URL(verzoek.url ?? "/", "http://stripe");
+      stand.verzoeken.push(`${verzoek.method} ${url.pathname}`);
+      stand.sleutels.add(String(verzoek.headers.authorization));
+      stand.versies.add(String(verzoek.headers["stripe-version"]));
+      if (verzoek.headers["idempotency-key"]) stand.eenmalig.push(String(verzoek.headers["idempotency-key"]));
+      const velden = new URLSearchParams(inhoud);
+      const geef = (status: number, lichaam: unknown) => {
+        antwoord.writeHead(status, { "Content-Type": "application/json" });
+        antwoord.end(JSON.stringify(lichaam));
+      };
+      const pad = url.pathname;
+      if (pad === "/v1/prices" && verzoek.method === "GET") {
+        const gevraagd = url.searchParams.getAll("lookup_keys[]");
+        return geef(200, { data: [...stand.prijzen.values()].filter((p) => gevraagd.includes(p.lookup_key)) });
+      }
+      if (pad === "/v1/prices" && verzoek.method === "POST") {
+        const prijs = { id: `price_${velden.get("lookup_key")}`, lookup_key: velden.get("lookup_key")!, unit_amount: Number(velden.get("unit_amount")), interval: velden.get("recurring[interval]")!, tax_behavior: velden.get("tax_behavior")! };
+        stand.prijzen.set(prijs.id, prijs);
+        return geef(200, prijs);
+      }
+      if (pad === `/v1/products/${product}`) return stand.product ? geef(200, { id: product }) : geef(404, { error: { message: "No such product" } });
+      if (pad === "/v1/products") {
+        stand.product = velden;
+        return geef(200, { id: velden.get("id") });
+      }
+      if (pad === "/v1/tax_rates" && verzoek.method === "GET") return geef(200, { data: stand.btw.map((id) => ({ id, percentage: 21, metadata: { [`jona_${app}`]: "btw" } })) });
+      if (pad === "/v1/tax_rates") {
+        stand.btw.push("txr_btw21");
+        return geef(200, { id: "txr_btw21" });
+      }
+      if (pad === "/v1/billing_portal/configurations" && verzoek.method === "GET") return geef(200, { data: stand.portalen.length ? [{ id: "bpc_jona", metadata: { [`jona_${app}`]: "abonnement" } }] : [] });
+      if (pad === "/v1/billing_portal/configurations") {
+        stand.portalen.push(velden);
+        return geef(200, { id: "bpc_jona" });
+      }
+      if (pad === "/v1/billing_portal/sessions") return geef(200, { url: `https://billing.stripe.com/p/session/${velden.get("customer")}` });
+      if (pad === "/v1/checkout/sessions" && verzoek.method === "POST") {
+        stand.sessies.push(velden);
+        return geef(200, { id: `cs_test_${"a".repeat(20)}${stand.sessies.length}`, url: `https://checkout.stripe.com/c/pay/${stand.sessies.length}` });
+      }
+      const sessie = pad.match(/^\/v1\/checkout\/sessions\/(cs_test_\w+)$/);
+      if (sessie) {
+        const s = stand.afrekeningen.get(sessie[1]!);
+        return s ? geef(200, { id: sessie[1], ...s }) : geef(404, { error: { message: "No such session" } });
+      }
+      if (pad === "/v1/customers" && verzoek.method === "GET") {
+        const email = url.searchParams.get("email");
+        return geef(200, {
+          data: stand.klanten
+            .filter((k) => k.email === email)
+            .map((k) => ({ id: k.id, object: "customer", email: k.email, subscriptions: { data: k.abonnementen.map((a) => ({ status: a.status, items: { data: [{ price: { product: a.product } }] } })) } })),
+        });
+      }
+      if (pad === "/v1/subscriptions" && verzoek.method === "GET") {
+        const klant = stand.klanten.find((k) => k.id === url.searchParams.get("customer"));
+        return geef(200, { data: (klant?.abonnementen ?? []).map((a) => ({ status: a.status, items: { data: [{ price: { product: a.product } }] } })) });
+      }
+      const coupon = pad.match(/^\/v1\/coupons\/(\w+)$/);
+      if (coupon) return stand.coupons.has(coupon[1]!) ? geef(200, { id: coupon[1] }) : geef(404, { error: { message: "No such coupon" } });
+      if (pad === "/v1/coupons" && verzoek.method === "POST") {
+        stand.coupons.add(velden.get("id")!);
+        stand.couponsGemaakt++;
+        return geef(200, { id: velden.get("id"), percent_off: Number(velden.get("percent_off")), duration: velden.get("duration") });
+      }
+      const abo = pad.match(/^\/v1\/subscriptions\/(sub_\w+)$/);
+      if (abo) {
+        const a = stand.abonnementen.get(abo[1]!);
+        return a ? geef(200, abonnementJson(a)) : geef(404, { error: { message: "No such subscription" } });
+      }
+      geef(404, { error: { message: `Onbekend: ${pad}` } });
+    });
+  });
+
+  return {
+    stand,
+    /** Start de server en geeft het adres terug. */
+    start: async () => {
+      await new Promise<void>((klaar) => server.listen(0, "127.0.0.1", klaar));
+      return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    },
+    stop: () => new Promise((klaar) => server.close(klaar)),
+  };
+}

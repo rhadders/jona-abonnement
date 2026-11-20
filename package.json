@@ -1,0 +1,34 @@
+{
+  "name": "@jona/abonnement",
+  "version": "1.0.0",
+  "description": "Het abonnement van een organisatie op een app van Jona: Stripe, proefperiode, bundelkorting en koppelen aan een bestaande klant.",
+  "license": "UNLICENSED",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "pakket": "npm run build && npm pack"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5",
+    "vitest": "^5.1.0"
+  }
+}
