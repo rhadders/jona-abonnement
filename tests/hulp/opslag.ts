@@ -9,7 +9,7 @@ export function maakGeheugenopslag() {
   const organisaties = new Map<string, Date>();
   const rijen = new Map<string, Rij>();
   const wachtrij = new Map<string, Promise<unknown>>();
-  const logboek: { organisatieId: string; namens: string; actie: string }[] = [];
+  const logboek: { organisatieId: string; namens: string; actie: string; details?: Record<string, unknown> }[] = [];
   const gelezenNamens: string[] = [];
   const LEEG: Rij = { stripeKlantId: null, stripeAbonnementId: null, plan: null, status: null, live: false, proefTot: null, periodeTot: null, stoptOp: null, vrijgesteld: false, proefVerlengdTot: null };
 
@@ -26,8 +26,8 @@ export function maakGeheugenopslag() {
           schrijf: async (velden) => {
             rijen.set(organisatieId, { ...(rijen.get(organisatieId) ?? LEEG), ...velden });
           },
-          log: async (actie) => {
-            logboek.push({ organisatieId, namens, actie });
+          log: async (actie, details) => {
+            logboek.push({ organisatieId, namens, actie, ...(details ? { details } : {}) });
           },
         }),
       );

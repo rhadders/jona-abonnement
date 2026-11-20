@@ -25,6 +25,24 @@ export const BUNDEL_COUPON = `jona_bundel_${BUNDELKORTING}`;
 /** Waaraan de apps elkaars producten herkennen. */
 export const JONA_VOORVOEGSEL = "jona_";
 
+/**
+ * De afspraak tussen de apps van Jona over de koppelcode: deze sleutels in de
+ * metadata van de Stripe-klant. `code` is de SHA-256-hash (hex) van de code,
+ * `tot` het verloopmoment in unix-seconden, `app` de app die de code maakte.
+ */
+export const KOPPEL = { code: "jona_koppelcode", tot: "jona_koppelcode_tot", app: "jona_koppelcode_app" } as const;
+
+/** Hoe de apps van Jona heten, voor wie een code uit een andere app invult. Een nieuwe app komt hier bij. */
+export const JONA_APPS: Record<string, string> = { bestuur: "Jona Bestuur", giften: "Jona Giften" };
+export const appNaam = (app: string | null) => (app && JONA_APPS[app]) || "een andere app van Jona";
+
+/**
+ * De twee instellingen van het klantportaal. `sleutel` staat in de metadata
+ * van de instelling bij Stripe, onder de naam van de app.
+ */
+export type Portaalsoort = "algemeen" | "opzeggen";
+export type Portaalinstelling = { sleutel: string; eenmalig: string };
+
 export type Planinstelling = { lookupKey: string; centen: number; interval: "year" | "month"; naam: string; eenmalig: string };
 
 export type Namen = {
@@ -35,7 +53,7 @@ export type Namen = {
   plannen: Record<Plan, Planinstelling>;
   /** Sleutels tegen dubbel aanmaken (Idempotency-Key). */
   eenmaligBtw: string;
-  eenmaligPortaal: string;
+  portalen: Record<Portaalsoort, Portaalinstelling>;
 };
 
 /**
@@ -53,6 +71,10 @@ export function namenVan(app: string, naam: string, prijzen: Record<Plan, number
     metadata: `jona_${app}`,
     plannen: { jaar: plan("jaar", "year"), maand: plan("maand", "month") },
     eenmaligBtw: `jona-${app}-btw-21`,
-    eenmaligPortaal: `jona-${app}-portaal-1`,
+    // De eerste instelling ("abonnement", portaal-1) kon nog opzeggen en wordt niet meer gebruikt.
+    portalen: {
+      algemeen: { sleutel: "portaal-2", eenmalig: `jona-${app}-portaal-2` },
+      opzeggen: { sleutel: "opzeggen-1", eenmalig: `jona-${app}-opzeggen-1` },
+    },
   };
 }

@@ -1,6 +1,6 @@
 import { createHmac, randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { abonnementUitMelding, bepaalStand, klopHandtekening, leesKoppelcode, maakKoppelcode, type Rij } from "../src/index.js";
+import { abonnementUitMelding, bepaalStand, klopHandtekening, type Rij } from "../src/index.js";
 
 // Geen vaste geheimen in een openbare repository: elke run maakt zijn eigen.
 const GEHEIM = randomBytes(24).toString("hex");
@@ -67,34 +67,5 @@ describe("meldingen", () => {
     expect(abonnementUitMelding(JSON.parse(melding({ id: "in_x", object: "invoice", parent: { subscription_details: { subscription: "sub_viaparent12" } } })))).toBe("sub_viaparent12");
     expect(abonnementUitMelding(JSON.parse(melding({ id: "pi_x", object: "payment_intent" })))).toBeNull();
     expect(abonnementUitMelding("onzin")).toBeNull();
-  });
-});
-
-describe("de koppelcode", () => {
-  const ONDERTEKENING = randomBytes(32).toString("hex");
-  const KLANT = "cus_gedeeld0001";
-
-  it("klopt alleen voor de eigen organisatie, ongewijzigd en binnen 24 uur", () => {
-    const nu = Date.now();
-    const code = maakKoppelcode(ONDERTEKENING, "org_a", KLANT, nu);
-    expect(leesKoppelcode(ONDERTEKENING, code, "org_a", nu)).toBe(KLANT);
-    expect(leesKoppelcode(ONDERTEKENING, code, "org_b", nu)).toBeNull();
-    expect(leesKoppelcode(ONDERTEKENING, code.replace(KLANT, "cus_iemandanders1"), "org_a", nu)).toBeNull();
-    expect(leesKoppelcode(ONDERTEKENING, code, "org_a", nu + 25 * 3600_000)).toBeNull();
-    expect(leesKoppelcode(ONDERTEKENING, "onzin", "org_a", nu)).toBeNull();
-    expect(leesKoppelcode(ONDERTEKENING, undefined, "org_a", nu)).toBeNull();
-  });
-
-  it("klopt niet met een ander geheim, en kan niet zonder geheim", () => {
-    const code = maakKoppelcode(ONDERTEKENING, "org_a", KLANT);
-    expect(leesKoppelcode(randomBytes(32).toString("hex"), code, "org_a")).toBeNull();
-    expect(() => maakKoppelcode("", "org_a", KLANT)).toThrow();
-  });
-
-  it("is dezelfde code als de apps maakten voordat het pakket er was", () => {
-    // Zo ondertekenden Jona Giften en Jona Bestuur: een link die onderweg is, blijft na de overstap geldig.
-    const tot = 1_800_000_000_000;
-    const verwacht = createHmac("sha256", ONDERTEKENING).update(`abonnement-koppelen:org_a.${KLANT}.${tot}`).digest("base64url");
-    expect(maakKoppelcode(ONDERTEKENING, "org_a", KLANT, tot - 24 * 3600_000)).toBe(`${KLANT}.${tot}.${verwacht}`);
   });
 });

@@ -1,6 +1,6 @@
 import { createHmac, randomBytes } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { maakAbonnement, STRIPE_VERSIE, SYSTEEM, type Koppelmail } from "../src/index.js";
+import { hashKoppelcode, maakAbonnement, normaliseerKoppelcode, STRIPE_VERSIE, SYSTEEM } from "../src/index.js";
 import { maakGeheugenopslag } from "./hulp/opslag.js";
 import { maakNepStripe } from "./hulp/stripe.js";
 
@@ -34,15 +34,14 @@ describe.each([
   const KLANT = "cus_gedeeld0001";
   const GEBRUIKER = "gebruiker_1";
   const email = "penningmeester@koppel.test";
+  const andereNaam = app === "giften" ? "Jona Bestuur" : "Jona Giften";
+  const andereKort = app === "giften" ? "bestuur" : "giften";
 
   const nep = maakNepStripe(app);
   const stripe = nep.stand;
   const geheugen = maakGeheugenopslag();
   const omgeving: Record<string, string | undefined> = {};
-  const mails: Koppelmail[] = [];
   const fouten: string[] = [];
-  let mailAan = true;
-  let mailLukt = true;
 
   const abonnement = maakAbonnement({
     app,
@@ -50,11 +49,6 @@ describe.each([
     omschrijving,
     omgeving: () => omgeving,
     opslag: geheugen.opslag,
-    mailIngesteld: () => mailAan,
-    stuurKoppelmail: async (mail) => {
-      if (mailLukt) mails.push(mail);
-      return mailLukt;
-    },
     logFout: (bericht) => void fouten.push(bericht),
   });
   const start = (organisatieId: string, plan: "jaar" | "maand", adres = "pen@voorbeeld.test") => abonnement.startAbonnement({ organisatieId, namens: GEBRUIKER, organisatieNaam: "Stichting Voorbeeld", email: adres, plan, herkomst });
@@ -64,7 +58,6 @@ describe.each([
     omgeving.STRIPE_API_URL = await nep.start();
     omgeving.ABONNEMENT_STRIPE_SECRET_KEY = NEPSLEUTEL;
     omgeving.ABONNEMENT_STRIPE_WEBHOOK_SECRET = GEHEIM;
-    omgeving.BETTER_AUTH_SECRET = randomBytes(32).toString("hex");
     geheugen.organisatie(NIEUW);
     geheugen.organisatie(OUD, 20);
     geheugen.organisatie(ANDER, 20);
@@ -153,13 +146,16 @@ describe.each([
       const aantal = stripe.sessies.length;
       expect(await start(OUD, "jaar")).toEqual({ ok: true, adres: "https://billing.stripe.com/p/session/cus_oud0000001" });
       expect(stripe.sessies).toHaveLength(aantal);
+      // Het gewone portaal: geen opzeggen, wisselen alleen voor het eigen product. De oude instelling wordt niet hergebruikt.
       expect(stripe.portalen).toHaveLength(1);
       const portaal = stripe.portalen[0]!;
-      expect(portaal.get(`metadata[jona_${app}]`)).toBe("abonnement");
-      expect(portaal.get("business_profile[headline]")).toBe(`${naam}: uw abonnement`);
-      expect(portaal.get("features[subscription_update][products][0][product]")).toBe(`jona_${app}_abonnement`);
-      expect(portaal.get("features[subscription_cancel][mode]")).toBe("at_period_end");
-      expect(stripe.eenmalig).toContain(`jona-${app}-portaal-1`);
+      expect(portaal.velden.get(`metadata[jona_${app}]`)).toBe("portaal-2");
+      expect(portaal.velden.get("business_profile[headline]")).toBe(`${naam}: facturen en betaalwijze`);
+      expect(portaal.velden.get("features[subscription_update][products][0][product]")).toBe(`jona_${app}_abonnement`);
+      expect(portaal.velden.get("features[subscription_cancel][enabled]")).toBe("false");
+      expect(stripe.eenmalig).toContain(`jona-${app}-portaal-2`);
+      expect(stripe.portaalsessies.at(-1)!.get("configuration")).toBe(portaal.id);
+      expect(stripe.portaalsessies.at(-1)!.get("flow_data[type]")).toBeNull();
       // Een tweede keer: het portaal wordt teruggevonden, niet opnieuw aangemaakt.
       abonnement.vergeet();
       expect((await abonnement.openPortaal({ organisatieId: OUD, namens: GEBRUIKER, herkomst })).ok).toBe(true);
@@ -269,47 +265,85 @@ describe.each([
     });
   });
 
-  describe("koppelen aan een bestaande klant bij Jona", () => {
-    const vraag = () => abonnement.vraagKoppelingAan({ organisatieId: KOPPEL, namens: GEBRUIKER, organisatieNaam: "Stichting Koppel", email, herkomst });
+  describe("koppelen aan een bestaande klant bij Jona met een koppelcode", () => {
+    // ANDER heeft een lopend abonnement op klant cus_ander00001: die maakt de code (app A). KOPPEL vult een code in (app B).
+    const KLANT_ANDER = "cus_ander00001";
+    const appA = { organisatieId: ANDER, namens: GEBRUIKER };
+    const hier = (code: unknown) => ({ organisatieId: KOPPEL, namens: GEBRUIKER, code });
+    const metadataVan = (id: string) => stripe.klanten.find((k) => k.id === id)!.metadata;
 
-    it("stuurt niets als er geen klant met dit adres is, met hetzelfde antwoord", async () => {
-      expect(await vraag()).toEqual({ ok: true });
-      expect(mails).toHaveLength(0);
-    });
+    /** Zet een code zoals de andere app dat doet. */
+    function codeVanAndereApp(code: string, tot = Date.now() + 7 * DAG) {
+      stripe.klanten.find((k) => k.id === KLANT)!.metadata = { jona_koppelcode: hashKoppelcode(normaliseerKoppelcode(code)!), jona_koppelcode_tot: String(Math.floor(tot / 1000)), jona_koppelcode_app: andereKort };
+    }
 
-    it("een klant met alleen een abonnement op deze app zelf, of een gestopt abonnement elders, telt niet", async () => {
+    beforeAll(() => {
       stripe.klanten = [
-        { id: "cus_alleenhier01", email, abonnementen: [{ status: "active", product: `jona_${app}_abonnement` }] },
-        { id: "cus_gestopt00001", email, abonnementen: [{ status: "canceled", product: andereApp }] },
-        { id: "cus_vreemdprod01", email, abonnementen: [{ status: "active", product: "prod_ietsanders" }] },
-        { id: KLANT, email: "iemand@anders.test", abonnementen: [{ status: "active", product: andereApp }] },
+        { id: KLANT_ANDER, email: "penning@ander.test", naam: "Stichting Ander", abonnementen: [{ status: "active", product: `jona_${app}_abonnement` }] },
+        { id: KLANT, email, naam: "Stichting Koppel", abonnementen: [{ status: "active", product: andereApp }] },
       ];
-      expect(await vraag()).toEqual({ ok: true });
-      expect(mails).toHaveLength(0);
     });
 
-    it("mislukt het versturen, dan is het antwoord hetzelfde en mag een volgende poging meteen", async () => {
-      stripe.klanten.push({ id: KLANT, email, abonnementen: [{ status: "active", product: andereApp }] });
-      mailLukt = false;
-      expect(await vraag()).toEqual({ ok: true });
-      mailLukt = true;
-      expect(mails).toHaveLength(0);
+    beforeEach(() => abonnement.vergeet());
+
+    it("app A: een code maken kan alleen met een lopend abonnement", async () => {
+      expect(await abonnement.maakKoppelcode({ organisatieId: KOPPEL, namens: GEBRUIKER })).toMatchObject({ ok: false, code: "koppelcode_alleen_met_abonnement" });
+      const gemaakt = await abonnement.maakKoppelcode(appA);
+      expect(gemaakt).toMatchObject({ ok: true });
+      if (!gemaakt.ok) return;
+      expect(gemaakt.code).toMatch(/^JONA-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/);
+      expect(gemaakt.tot.getTime() - Date.now()).toBeGreaterThan(6.9 * DAG);
+      // Bij Stripe staat alleen de hash, niet de code zelf.
+      const metadata = { ...metadataVan(KLANT_ANDER)! };
+      expect(metadata).toEqual({ jona_koppelcode: hashKoppelcode(normaliseerKoppelcode(gemaakt.code)!), jona_koppelcode_tot: String(Math.floor(gemaakt.tot.getTime() / 1000)), jona_koppelcode_app: app });
+      expect(JSON.stringify(metadata)).not.toContain(gemaakt.code.slice(5, 9));
+      expect(await abonnement.haalCodeStand(KLANT_ANDER)).toEqual({ tot: new Date(Math.floor(gemaakt.tot.getTime() / 1000) * 1000) });
+      expect(geheugen.logboek.at(-1)).toEqual({ organisatieId: ANDER, namens: GEBRUIKER, actie: "abonnement.koppelcode_gemaakt" });
+      // Een nieuwe code vervangt de oude.
+      const tweede = await abonnement.maakKoppelcode(appA);
+      expect(tweede.ok && tweede.code !== gemaakt.code).toBe(true);
+      expect(metadataVan(KLANT_ANDER)!.jona_koppelcode).not.toBe(metadata.jona_koppelcode);
     });
 
-    it("stuurt een link als het adres al klant is bij een andere app van Jona, hooguit één per uur", async () => {
-      expect(await vraag()).toEqual({ ok: true });
-      expect(await vraag()).toEqual({ ok: true });
-      expect(mails).toHaveLength(1);
-      expect(mails[0]).toMatchObject({ organisatieId: KOPPEL, namens: GEBRUIKER, organisatieNaam: "Stichting Koppel", email });
-      expect(mails[0]!.adres.startsWith(`${herkomst}/abonnement/koppelen?code=`)).toBe(true);
-      expect(abonnement.leesKoppelcode(new URL(mails[0]!.adres).searchParams.get("code"), KOPPEL)).toBe(KLANT);
+    it("app A: intrekken wist de code", async () => {
+      expect(await abonnement.trekKoppelcodeIn(appA)).toEqual({ ok: true });
+      expect(metadataVan(KLANT_ANDER)).toEqual({});
+      expect(await abonnement.haalCodeStand(KLANT_ANDER)).toBeNull();
+      expect(geheugen.logboek.at(-1)).toMatchObject({ actie: "abonnement.koppelcode_ingetrokken" });
     });
 
-    it("zonder e-mailinstelling kan koppelen niet", async () => {
-      mailAan = false;
-      expect(abonnement.koppelenKan()).toBe(false);
-      expect(await vraag()).toMatchObject({ ok: false, code: "koppelen_kan_niet" });
-      mailAan = true;
+    it("app B: een code van deze app zelf werkt hier niet", async () => {
+      const gemaakt = await abonnement.maakKoppelcode(appA);
+      expect(gemaakt.ok).toBe(true);
+      if (!gemaakt.ok) return;
+      expect(await abonnement.controleerKoppelcode(hier(gemaakt.code))).toMatchObject({ ok: false, code: "koppelcode_zelfde_app", fout: expect.stringContaining(`gemaakt in ${naam}`) });
+      await abonnement.trekKoppelcodeIn(appA);
+    });
+
+    it("app B: een onbekende, verlopen of nog niet vindbare code werkt niet", async () => {
+      codeVanAndereApp("JONA-AAAA-BBBB-CCCC", Date.now() - 1000);
+      expect(await abonnement.controleerKoppelcode(hier("JONA-AAAA-BBBB-CCCC"))).toMatchObject({ ok: false, code: "koppelcode_ongeldig" });
+      expect(await abonnement.controleerKoppelcode(hier("JONA-AAAA-BBBB-CCCD"))).toMatchObject({ ok: false });
+      expect(await abonnement.controleerKoppelcode(hier("onzin"))).toMatchObject({ ok: false });
+      codeVanAndereApp("JONA-AAAA-BBBB-CCCC");
+      stripe.zoekenLooptAchter = true;
+      expect(await abonnement.controleerKoppelcode(hier("JONA-AAAA-BBBB-CCCC"))).toMatchObject({ ok: false, fout: expect.stringContaining("een minuut") });
+      stripe.zoekenLooptAchter = false;
+    });
+
+    it("app B: na 5 verkeerde pogingen in een uur werkt ook een goede code even niet", async () => {
+      codeVanAndereApp("JONA-AAAA-BBBB-CCCC");
+      for (let i = 0; i < 5; i++) expect(await abonnement.controleerKoppelcode(hier(`JONA-AAAA-BBBB-DDD${i}`))).toMatchObject({ ok: false });
+      expect(await abonnement.controleerKoppelcode(hier("JONA-AAAA-BBBB-CCCC"))).toMatchObject({ ok: false, code: "koppelcode_te_vaak" });
+      abonnement.vergeet();
+      expect(await abonnement.controleerKoppelcode(hier("JONA-AAAA-BBBB-CCCC"))).toMatchObject({ ok: true });
+    });
+
+    it("app B: de controle toont de klant en de app, en koppelt nog niets", async () => {
+      codeVanAndereApp("JONA-AAAA-BBBB-CCCC");
+      expect(await abonnement.controleerKoppelcode(hier("jona aaaa bbbb cccc"))).toEqual({ ok: true, naam: "Stichting Koppel", app: andereNaam });
+      expect(await abonnement.haalStand(KOPPEL)).toMatchObject({ soort: "proef", klantId: null });
+      expect(metadataVan(KLANT)!.jona_koppelcode).toBeTruthy();
     });
 
     it("zonder gekoppelde klant geen bundelkorting, wel een veld voor een kortingscode", async () => {
@@ -320,17 +354,13 @@ describe.each([
       expect(stripe.couponsGemaakt).toBe(0);
     });
 
-    it("weigert een code van een andere organisatie of een verlopen code", async () => {
-      expect(await abonnement.bevestigKoppeling({ organisatieId: KOPPEL, namens: GEBRUIKER, code: abonnement.maakKoppelcode(ANDER, KLANT) })).toMatchObject({ ok: false, code: "koppellink_verlopen" });
-      expect(await abonnement.bevestigKoppeling({ organisatieId: KOPPEL, namens: GEBRUIKER, code: abonnement.maakKoppelcode(KOPPEL, KLANT, Date.now() - 25 * 3600_000) })).toMatchObject({ ok: false });
-      expect(await abonnement.haalStand(KOPPEL)).toMatchObject({ soort: "proef", klantId: null });
-      expect(geheugen.logboek).toEqual([]);
-    });
-
-    it("na bevestigen komt het abonnement op de bestaande klant, met een regel in het auditlog", async () => {
-      expect(await abonnement.bevestigKoppeling({ organisatieId: KOPPEL, namens: GEBRUIKER, code: abonnement.maakKoppelcode(KOPPEL, KLANT) })).toEqual({ ok: true });
-      expect(geheugen.logboek).toEqual([{ organisatieId: KOPPEL, namens: GEBRUIKER, actie: "abonnement.klant_gekoppeld" }]);
+    it("na koppelen komt het abonnement op de bestaande klant, en werkt de code niet nog eens", async () => {
+      codeVanAndereApp("JONA-AAAA-BBBB-CCCC");
+      expect(await abonnement.bevestigKoppeling(hier("JONA-AAAA-BBBB-CCCC"))).toEqual({ ok: true, klantId: KLANT, naam: "Stichting Koppel", email, app: andereNaam });
       expect(await abonnement.haalStand(KOPPEL)).toMatchObject({ soort: "proef", klantId: KLANT });
+      expect(metadataVan(KLANT)).toEqual({});
+      expect(geheugen.logboek.at(-1)).toEqual({ organisatieId: KOPPEL, namens: GEBRUIKER, actie: "abonnement.klant_gekoppeld", details: { via: "koppelcode" } });
+
       expect((await start(KOPPEL, "jaar", email)).ok).toBe(true);
       const sessie = stripe.sessies.at(-1)!;
       expect(sessie.get("customer")).toBe(KLANT);
@@ -342,19 +372,61 @@ describe.each([
       expect((await start(KOPPEL, "jaar", email)).ok).toBe(true);
       expect(stripe.couponsGemaakt).toBe(1);
       // Loopt het andere abonnement niet meer, dan is er geen bundelkorting.
-      for (const klant of stripe.klanten.filter((k) => k.id === KLANT)) klant.abonnementen[0]!.status = "canceled";
+      stripe.klanten.find((k) => k.id === KLANT)!.abonnementen[0]!.status = "canceled";
       expect((await start(KOPPEL, "jaar", email)).ok).toBe(true);
       expect(stripe.sessies.at(-1)!.get("discounts[0][coupon]")).toBeNull();
       expect(stripe.sessies.at(-1)!.get("allow_promotion_codes")).toBe("true");
-      // Eenmaal gekoppeld vraagt de app geen tweede link meer aan.
-      abonnement.vergeet();
-      expect(await vraag()).toMatchObject({ ok: false, code: "organisatie_al_gekoppeld" });
+      // Eenmaal gekoppeld kan er niet nog eens gekoppeld worden.
+      codeVanAndereApp("JONA-AAAA-BBBB-EEEE");
+      expect(await abonnement.controleerKoppelcode(hier("JONA-AAAA-BBBB-EEEE"))).toMatchObject({ ok: false, code: "organisatie_al_gekoppeld" });
     });
 
-    it("koppelen kan niet meer als er al een abonnement loopt of een andere klant is", async () => {
-      expect(await abonnement.bevestigKoppeling({ organisatieId: ANDER, code: abonnement.maakKoppelcode(ANDER, KLANT) })).toMatchObject({ ok: false, code: "abonnement_loopt_koppelen" });
-      expect(await abonnement.haalStand(ANDER)).toMatchObject({ soort: "abonnement", klantId: "cus_ander00001" });
-      expect(await abonnement.bevestigKoppeling({ organisatieId: OUD, code: abonnement.maakKoppelcode(OUD, KLANT) })).toMatchObject({ ok: false, code: "organisatie_heeft_klant" });
+    it("koppelen kan niet meer als er al een abonnement loopt", async () => {
+      codeVanAndereApp("JONA-AAAA-BBBB-CCCC");
+      expect(await abonnement.bevestigKoppeling({ ...appA, code: "JONA-AAAA-BBBB-CCCC" })).toMatchObject({ ok: false, code: "abonnement_loopt_koppelen" });
+      expect(await abonnement.haalStand(ANDER)).toMatchObject({ soort: "abonnement", klantId: KLANT_ANDER });
+    });
+
+    it("een fout van Stripe bij het zoeken geeft een gewone zin, en telt niet als verkeerde poging", async () => {
+      const echt = omgeving.STRIPE_API_URL;
+      const nieuw = "org_nieuw_koppel";
+      geheugen.organisatie(nieuw);
+      omgeving.STRIPE_API_URL = "http://127.0.0.1:1";
+      for (let i = 0; i < 6; i++) expect(await abonnement.controleerKoppelcode({ organisatieId: nieuw, code: "JONA-AAAA-BBBB-CCCC" })).toMatchObject({ ok: false, code: "koppelcode_controleren_mislukt" });
+      omgeving.STRIPE_API_URL = echt;
+    });
+  });
+
+  describe("opzeggen, voor alleen het eigen abonnement", () => {
+    it("opent Stripe in de flow voor opzeggen van alleen dit abonnement, met een eigen instelling", async () => {
+      expect(await abonnement.openOpzeggen({ organisatieId: ANDER, namens: GEBRUIKER, herkomst })).toEqual({ ok: true, adres: "https://billing.stripe.com/p/session/cus_ander00001" });
+      const sessie = stripe.portaalsessies.at(-1)!;
+      expect(sessie.get("flow_data[type]")).toBe("subscription_cancel");
+      expect(sessie.get("flow_data[subscription_cancel][subscription]")).toBe("sub_ander00001");
+      expect(sessie.get("flow_data[after_completion][type]")).toBe("redirect");
+      expect(sessie.get("flow_data[after_completion][redirect][return_url]")).toBe(`${herkomst}/abonnement?opgezegd=1`);
+      const instelling = stripe.portalen.find((p) => p.id === sessie.get("configuration"))!;
+      expect(instelling.velden.get(`metadata[jona_${app}]`)).toBe("opzeggen-1");
+      expect(instelling.velden.get("business_profile[headline]")).toBe(`${naam}: abonnement opzeggen`);
+      expect(instelling.velden.get("features[subscription_cancel][enabled]")).toBe("true");
+      expect(instelling.velden.get("features[subscription_cancel][mode]")).toBe("at_period_end");
+      expect(instelling.velden.get("features[invoice_history][enabled]")).toBe("false");
+      expect(stripe.eenmalig).toContain(`jona-${app}-opzeggen-1`);
+    });
+
+    it("zonder lopend abonnement valt er niets op te zeggen", async () => {
+      expect(await abonnement.openOpzeggen({ organisatieId: OUD, herkomst })).toMatchObject({ ok: false, code: "geen_lopend_abonnement" });
+    });
+
+    it("een opzegging draait terug, en dan loopt het abonnement door", async () => {
+      expect(await abonnement.draaiOpzeggingTerug({ organisatieId: ANDER })).toMatchObject({ ok: false, code: "geen_opzegging" });
+      stripe.abonnementen.get("sub_ander00001")!.cancelAtPeriodEnd = true;
+      await abonnement.werkBij(ANDER);
+      expect(await abonnement.haalStand(ANDER)).toMatchObject({ soort: "abonnement", stoptOp: expect.any(Date) });
+      expect(await abonnement.openOpzeggen({ organisatieId: ANDER, herkomst })).toMatchObject({ ok: false, code: "al_opgezegd" });
+      expect(await abonnement.draaiOpzeggingTerug({ organisatieId: ANDER, namens: GEBRUIKER })).toEqual({ ok: true });
+      expect(stripe.abonnementen.get("sub_ander00001")!.cancelAtPeriodEnd).toBe(false);
+      expect(await abonnement.haalStand(ANDER)).toMatchObject({ soort: "abonnement", stoptOp: null });
     });
   });
 
