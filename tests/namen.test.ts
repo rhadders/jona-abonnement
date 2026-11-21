@@ -38,6 +38,19 @@ describe("de namen bij Stripe", () => {
     });
   });
 
+  it("Jona Roosters", () => {
+    expect(namenVan("roosters", "Jona Roosters")).toEqual({
+      product: "jona_roosters_abonnement",
+      metadata: "jona_roosters",
+      plannen: {
+        jaar: { lookupKey: "jona_roosters_jaar", centen: 11940, interval: "year", naam: "Jona Roosters per jaar", eenmalig: "jona-roosters-prijs-jona_roosters_jaar-11940" },
+        maand: { lookupKey: "jona_roosters_maand", centen: 1295, interval: "month", naam: "Jona Roosters per maand", eenmalig: "jona-roosters-prijs-jona_roosters_maand-1295" },
+      },
+      eenmaligBtw: "jona-roosters-btw-21",
+      portalen: { algemeen: { sleutel: "portaal-2", eenmalig: "jona-roosters-portaal-2" }, opzeggen: { sleutel: "opzeggen-1", eenmalig: "jona-roosters-opzeggen-1" } },
+    });
+  });
+
   it("de coupon van de bundelkorting is van alle apps samen", () => {
     expect(BUNDEL_COUPON).toBe("jona_bundel_15");
   });

@@ -26,6 +26,7 @@ function melding(onderwerp: Record<string, unknown>, soort = "customer.subscript
 describe.each([
   { app: "giften", naam: "Jona Giften", omschrijving: "Giftenadministratie voor kerken en stichtingen", herkomst: "https://jonagiften.nl", andereApp: "jona_bestuur_abonnement" },
   { app: "bestuur", naam: "Jona Bestuur", omschrijving: "Vergaderen, notuleren en besluiten voor besturen", herkomst: "https://jonabestuur.nl", andereApp: "jona_giften_abonnement" },
+  { app: "roosters", naam: "Jona Roosters", omschrijving: "Roosters voor vrijwilligers van stichtingen, verenigingen en kerken", herkomst: "https://jonaroosters.nl", andereApp: "jona_giften_abonnement" },
 ])("het abonnement op $naam", ({ app, naam, omschrijving, herkomst, andereApp }) => {
   const NIEUW = "org_nieuw"; // vandaag aangemaakt: in de proef
   const OUD = "org_oud"; // 20 dagen geleden: proef voorbij
