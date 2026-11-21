@@ -33,7 +33,7 @@ export const JONA_VOORVOEGSEL = "jona_";
 export const KOPPEL = { code: "jona_koppelcode", tot: "jona_koppelcode_tot", app: "jona_koppelcode_app" } as const;
 
 /** Hoe de apps van Jona heten, voor wie een code uit een andere app invult. Een nieuwe app komt hier bij. */
-export const JONA_APPS: Record<string, string> = { bestuur: "Jona Bestuur", giften: "Jona Giften" };
+export const JONA_APPS: Record<string, string> = { bestuur: "Jona Bestuur", giften: "Jona Giften", roosters: "Jona Roosters" };
 export const appNaam = (app: string | null) => (app && JONA_APPS[app]) || "een andere app van Jona";
 
 /**

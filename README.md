@@ -1,7 +1,7 @@
 # @jona/abonnement
 
 Het abonnement van een organisatie op een app van Jona, op één plek. Elke app
-van Jona (Jona Giften, Jona Bestuur) gebruikt dit pakket, zodat de regels
+van Jona (Jona Giften, Jona Bestuur, Jona Roosters) gebruikt dit pakket, zodat de regels
 overal gelijk zijn: 14 dagen proef, per jaar of per maand, het klantportaal
 van Stripe, opzeggen, koppelen aan een bestaande klant met een koppelcode en
 15% bundelkorting.
@@ -60,7 +60,7 @@ geen Next.js en geen React.
 
 ## Namen bij Stripe
 
-Uit het korte woord van de app (`giften`, `bestuur`) volgt alles:
+Uit het korte woord van de app (`giften`, `bestuur`, `roosters`) volgt alles:
 
 | Wat | Vorm |
 | --- | --- |
@@ -201,7 +201,8 @@ Semver: een oplossing is een patch, iets erbij een minor, en wat de vorm van
 
 ### Een app erbij
 
-Voeg de app toe aan `tests/namen.test.ts` en aan de reeks in
+Voeg de app toe aan `JONA_APPS` in `src/namen.ts` (de naam die een andere app
+toont bij een koppelcode), aan `tests/namen.test.ts` en aan de reeks in
 `tests/abonnement.test.ts`. Het woord van de app is één woord in kleine
 letters.
 
