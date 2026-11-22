@@ -1,6 +1,7 @@
 import { faalt, type Foutcode } from "./fouten.js";
 import { isAbonnementId, isKlantId, isSessieId, object, tekst, type Rauw } from "./meldingen.js";
 import { BUNDEL_COUPON, BUNDELKORTING, JONA_VOORVOEGSEL, KOPPEL, namenVan, PLANNEN, type Namen, type Plan, type Portaalsoort } from "./namen.js";
+import { leesTaal, type Taal } from "./taal.js";
 
 /**
  * Stripe voor het abonnement van organisaties op een app van Jona. Het is het
@@ -49,6 +50,8 @@ export type StripeAbonnement = {
 };
 
 export type Afrekening = {
+  /** De taal van de betaalpagina; standaard Nederlands. */
+  taal?: Taal;
   organisatieId: string;
   organisatieNaam: string;
   plan: Plan;
@@ -65,6 +68,16 @@ export type Afrekening = {
 export type KlantMetCode = { id: string; naam: string | null; email: string | null; hash: string | null; tot: Date | null; app: string | null };
 
 type Velden = [string, string][];
+
+/** De taal van de pagina's van Stripe: betaalpagina en klantportaal. */
+const LOCALE: Record<Taal, string> = { nl: "nl", en: "en-GB", de: "de" };
+
+/** De omschrijving van het abonnement, op de factuur: "Jona Giften voor Stichting Voorbeeld". */
+const VOOR: Record<Taal, (app: string, organisatie: string) => string> = {
+  nl: (app, organisatie) => `${app} voor ${organisatie}`,
+  en: (app, organisatie) => `${app} for ${organisatie}`,
+  de: (app, organisatie) => `${app} für ${organisatie}`,
+};
 type Inrichting = { prijzen: Record<Plan, string>; btw: string | null };
 
 /** Standen waarin een abonnement loopt. */
@@ -287,35 +300,43 @@ export function maakStripe(instelling: StripeInstelling) {
     return id ? { ok: true, waarde: id } : mislukt(0, "stripe_geen_portaal");
   }
 
-  async function portaalSessie(soort: Portaalsoort, velden: Velden): Promise<Antwoord<string>> {
+  async function portaalSessie(soort: Portaalsoort, velden: Velden, taal: Taal | undefined): Promise<Antwoord<string>> {
     const ingericht = await zorgVoorInrichting();
     if (!ingericht.ok) return ingericht;
     const configuratie = await zorgVoorPortaal(soort, ingericht.waarde.prijzen);
     if (!configuratie.ok) return configuratie;
-    const antwoord = await vraag("billing_portal/sessions", { methode: "POST", velden: [...velden, ["configuration", configuratie.waarde], ["locale", "nl"]] });
+    const antwoord = await vraag("billing_portal/sessions", { methode: "POST", velden: [...velden, ["configuration", configuratie.waarde], ["locale", LOCALE[leesTaal(taal)]]] });
     if (!antwoord.ok) return antwoord;
     const url = tekst(antwoord.waarde.url);
     return url && /^https:\/\//.test(url) ? { ok: true, waarde: url } : mislukt(0, "stripe_geen_portaal");
   }
 
   /** Het klantportaal van Stripe: facturen, betaalwijze en wisselen tussen jaar en maand. Opzeggen kan hier niet. */
-  function maakPortaal(klantId: string, terugadres: string): Promise<Antwoord<string>> {
-    return portaalSessie("algemeen", [
-      ["customer", klantId],
-      ["return_url", terugadres],
-    ]);
+  function maakPortaal(klantId: string, terugadres: string, taal?: Taal): Promise<Antwoord<string>> {
+    return portaalSessie(
+      "algemeen",
+      [
+        ["customer", klantId],
+        ["return_url", terugadres],
+      ],
+      taal,
+    );
   }
 
   /** Het portaal in de flow voor opzeggen, voor alleen dit abonnement. Na het opzeggen gaat de klant naar `naOpzeggen`. */
-  function maakOpzegPortaal(invoer: { klantId: string; abonnementId: string; terugadres: string; naOpzeggen: string }): Promise<Antwoord<string>> {
-    return portaalSessie("opzeggen", [
-      ["customer", invoer.klantId],
-      ["return_url", invoer.terugadres],
-      ["flow_data[type]", "subscription_cancel"],
-      ["flow_data[subscription_cancel][subscription]", invoer.abonnementId],
-      ["flow_data[after_completion][type]", "redirect"],
-      ["flow_data[after_completion][redirect][return_url]", invoer.naOpzeggen],
-    ]);
+  function maakOpzegPortaal(invoer: { klantId: string; abonnementId: string; terugadres: string; naOpzeggen: string; taal?: Taal }): Promise<Antwoord<string>> {
+    return portaalSessie(
+      "opzeggen",
+      [
+        ["customer", invoer.klantId],
+        ["return_url", invoer.terugadres],
+        ["flow_data[type]", "subscription_cancel"],
+        ["flow_data[subscription_cancel][subscription]", invoer.abonnementId],
+        ["flow_data[after_completion][type]", "redirect"],
+        ["flow_data[after_completion][redirect][return_url]", invoer.naOpzeggen],
+      ],
+      invoer.taal,
+    );
   }
 
   /**
@@ -340,17 +361,18 @@ export function maakStripe(instelling: StripeInstelling) {
    * minstens twee dagen, dus korter dan dat begint het abonnement direct.
    */
   async function maakAfrekening(invoer: Afrekening): Promise<Antwoord<string>> {
+    const taal = leesTaal(invoer.taal);
     const ingericht = await zorgVoorInrichting();
     if (!ingericht.ok) return ingericht;
     const velden: Velden = [
       ["mode", "subscription"],
-      ["locale", "nl"],
+      ["locale", LOCALE[taal]],
       ["line_items[0][price]", ingericht.waarde.prijzen[invoer.plan]],
       ["line_items[0][quantity]", "1"],
       ["client_reference_id", invoer.organisatieId],
       ["metadata[organisatie_id]", invoer.organisatieId],
       ["subscription_data[metadata][organisatie_id]", invoer.organisatieId],
-      ["subscription_data[description]", `${instelling.naam} voor ${invoer.organisatieNaam}`.slice(0, 200)],
+      ["subscription_data[description]", VOOR[taal](instelling.naam, invoer.organisatieNaam).slice(0, 200)],
       ["billing_address_collection", "required"],
       ["tax_id_collection[enabled]", "true"],
       ["success_url", invoer.terugadres],

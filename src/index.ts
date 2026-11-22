@@ -1,6 +1,6 @@
 export { maakAbonnement, SYSTEEM } from "./abonnement.js";
 export type { Abonnement, Adres, Bewerking, CodeStand, Gelukt, GevondenKlant, Instelling, MeldingUitkomst, Opslag, Schrijfvelden } from "./abonnement.js";
-export { faalt, FOUTEN } from "./fouten.js";
+export { faalt, foutIn, FOUTEN } from "./fouten.js";
 export type { Foutcode, Mislukt } from "./fouten.js";
 export { hashKoppelcode, nieuweKoppelcode, normaliseerKoppelcode } from "./koppelcode.js";
 export { abonnementUitMelding, isAbonnementId, isKlantId, isSessieId, klopHandtekening } from "./meldingen.js";
@@ -10,3 +10,5 @@ export { bepaalStand, MET_TOEGANG, PROEFDAGEN } from "./stand.js";
 export type { Rij, Stand } from "./stand.js";
 export { maakStripe, STRIPE_VERSIE } from "./stripe.js";
 export type { Afrekening, Antwoord, KlantMetCode, Omgeving, Stripe, StripeAbonnement, StripeInstelling } from "./stripe.js";
+export { isTaal, leesTaal, STANDAARDTAAL, TALEN } from "./taal.js";
+export type { Taal } from "./taal.js";

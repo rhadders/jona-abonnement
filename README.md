@@ -58,6 +58,25 @@ geen Next.js en geen React.
 - Zonder `ABONNEMENT_STRIPE_SECRET_KEY` staan abonnementen uit en heeft
   iedereen toegang.
 
+## Talen
+
+Het pakket kent Nederlands, Engels (Brits) en Duits (met "du"). Zonder taal
+blijft alles Nederlands, zoals voorheen.
+
+- **Pagina's bij Stripe**: geef `taal` ("nl", "en" of "de") mee aan
+  `startAbonnement`, `openPortaal` en `openOpzeggen`. De betaalpagina en het
+  klantportaal openen dan in die taal, en de omschrijving op de factuur ook
+  ("Jona Roosters for Example Trust").
+- **Foutmeldingen**: een uitkomst draagt de Nederlandse zin en een code;
+  `foutIn(code, taal)` geeft de zin in de taal van het scherm.
+- **Koppelcode**: `controleerKoppelcode` en `bevestigKoppeling` kennen `taal`
+  voor de naam van een onbekende app en de melding bij een code uit de app
+  zelf. `appNaam(app, taal)` doet hetzelfde los.
+
+De koppen van het klantportaal ("facturen en betaalwijze") staan in de
+instelling bij Stripe, die alle apps delen, en blijven Nederlands; de knoppen
+en uitleg van Stripe zelf volgen de taal.
+
 ## Namen bij Stripe
 
 Uit het korte woord van de app (`giften`, `bestuur`, `roosters`) volgt alles:
