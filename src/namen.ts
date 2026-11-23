@@ -8,6 +8,8 @@
  * of prijs niet terugvindt, maakt ze opnieuw aan, en dan staan ze dubbel.
  */
 
+import { leesTaal, STANDAARDTAAL, type Taal } from "./taal.js";
+
 export const PLANNEN = ["jaar", "maand"] as const;
 export type Plan = (typeof PLANNEN)[number];
 
@@ -34,7 +36,8 @@ export const KOPPEL = { code: "jona_koppelcode", tot: "jona_koppelcode_tot", app
 
 /** Hoe de apps van Jona heten, voor wie een code uit een andere app invult. Een nieuwe app komt hier bij. */
 export const JONA_APPS: Record<string, string> = { bestuur: "Jona Bestuur", giften: "Jona Giften", roosters: "Jona Roosters" };
-export const appNaam = (app: string | null) => (app && JONA_APPS[app]) || "een andere app van Jona";
+const ANDERE_APP: Record<Taal, string> = { nl: "een andere app van Jona", en: "another Jona app", de: "eine andere App von Jona" };
+export const appNaam = (app: string | null, taal: Taal = STANDAARDTAAL) => (app && JONA_APPS[app]) || ANDERE_APP[leesTaal(taal)];
 
 /**
  * De twee instellingen van het klantportaal. `sleutel` staat in de metadata

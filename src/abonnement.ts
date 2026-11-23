@@ -4,6 +4,7 @@ import { abonnementUitMelding, klopHandtekening } from "./meldingen.js";
 import { appNaam, type Plan } from "./namen.js";
 import { bepaalStand, MET_TOEGANG, type Rij, type Stand } from "./stand.js";
 import { maakStripe, type StripeAbonnement, type StripeInstelling } from "./stripe.js";
+import { leesTaal, type Taal } from "./taal.js";
 
 /**
  * Het abonnement van een organisatie op een app van Jona, van begin tot eind:
@@ -67,6 +68,18 @@ const POGINGEN = 5;
 const MAX_MELDING = 500_000;
 
 export type Abonnement = ReturnType<typeof maakAbonnement>;
+
+/**
+ * Een ingevulde koppelcode. `taal` is de taal van het scherm: daarin komen de
+ * naam van een onbekende app en de melding bij een code uit deze app zelf.
+ */
+type Koppelinvoer = { organisatieId: string; namens?: string; code: unknown; taal?: Taal };
+
+const ZELFDE_APP: Record<Taal, (app: string) => string> = {
+  nl: (app) => `Deze code is gemaakt in ${app}. Gebruik hem in een andere app van Jona.`,
+  en: (app) => `This code was created in ${app}. Use it in another Jona app.`,
+  de: (app) => `Dieser Code wurde in ${app} erstellt. Verwende ihn in einer anderen App von Jona.`,
+};
 
 export function maakAbonnement(instelling: Instelling) {
   const stripe = maakStripe(instelling);
@@ -201,11 +214,11 @@ export function maakAbonnement(instelling: Instelling) {
   /* ------------------------------------------------------ afrekenen */
 
   /** Het adres van de betaalpagina van Stripe, of van het klantportaal als er al een lopend abonnement is. */
-  async function startAbonnement(invoer: { organisatieId: string; namens?: string; organisatieNaam: string; email: string; plan: Plan; herkomst: string }): Promise<Adres> {
+  async function startAbonnement(invoer: { organisatieId: string; namens?: string; organisatieNaam: string; email: string; plan: Plan; herkomst: string; taal?: Taal }): Promise<Adres> {
     if (!aan()) return faalt("abonnementen_uit");
     const namens = invoer.namens ?? SYSTEEM;
     const stand = await haalStand(invoer.organisatieId, namens);
-    if (stand.soort === "abonnement" && stand.klantId) return openPortaal({ organisatieId: invoer.organisatieId, namens, herkomst: invoer.herkomst });
+    if (stand.soort === "abonnement" && stand.klantId) return openPortaal({ organisatieId: invoer.organisatieId, namens, herkomst: invoer.herkomst, taal: invoer.taal });
     const klantId = stand.soort === "uit" || stand.soort === "vrij" ? null : stand.klantId;
     // Een klant met een lopend abonnement op een andere app van Jona krijgt de bundelkorting.
     // De klant is dan altijd via de bevestiging per e-mail gekoppeld, of van deze organisatie zelf.
@@ -215,6 +228,7 @@ export function maakAbonnement(instelling: Instelling) {
       return faalt("betaalpagina_mislukt");
     }
     const uitkomst = await stripe.maakAfrekening({
+      taal: invoer.taal,
       organisatieId: invoer.organisatieId,
       organisatieNaam: invoer.organisatieNaam,
       plan: invoer.plan,
@@ -232,10 +246,10 @@ export function maakAbonnement(instelling: Instelling) {
     return { ok: true, adres: uitkomst.waarde };
   }
 
-  async function openPortaal(invoer: { organisatieId: string; namens?: string; herkomst: string }): Promise<Adres> {
+  async function openPortaal(invoer: { organisatieId: string; namens?: string; herkomst: string; taal?: Taal }): Promise<Adres> {
     const rij = await opslag.leesRij(invoer.organisatieId, invoer.namens ?? SYSTEEM);
     if (!rij?.stripeKlantId) return faalt("geen_abonnement");
-    const uitkomst = await stripe.maakPortaal(rij.stripeKlantId, `${invoer.herkomst}/abonnement`);
+    const uitkomst = await stripe.maakPortaal(rij.stripeKlantId, `${invoer.herkomst}/abonnement`, invoer.taal);
     if (!uitkomst.ok) {
       await log("Abonnement: portaal mislukt", { organisatie: invoer.organisatieId, detail: uitkomst.fout });
       return faalt("portaal_mislukt");
@@ -257,11 +271,11 @@ export function maakAbonnement(instelling: Instelling) {
    * organisatie. In het gewone portaal kan dat niet: de klant kan gedeeld zijn
    * met andere apps van Jona, en het portaal toont al hun abonnementen.
    */
-  async function openOpzeggen(invoer: { organisatieId: string; namens?: string; herkomst: string }): Promise<Adres> {
+  async function openOpzeggen(invoer: { organisatieId: string; namens?: string; herkomst: string; taal?: Taal }): Promise<Adres> {
     const lopend = await lopendAbonnement(invoer.organisatieId, invoer.namens ?? SYSTEEM);
     if (!lopend) return faalt("geen_lopend_abonnement");
     if (lopend.opgezegd) return faalt("al_opgezegd");
-    const uitkomst = await stripe.maakOpzegPortaal({ klantId: lopend.klantId, abonnementId: lopend.abonnementId, terugadres: `${invoer.herkomst}/abonnement`, naOpzeggen: `${invoer.herkomst}/abonnement?opgezegd=1` });
+    const uitkomst = await stripe.maakOpzegPortaal({ klantId: lopend.klantId, abonnementId: lopend.abonnementId, terugadres: `${invoer.herkomst}/abonnement`, naOpzeggen: `${invoer.herkomst}/abonnement?opgezegd=1`, taal: invoer.taal });
     if (!uitkomst.ok) {
       await log("Abonnement: opzeggen openen mislukt", { organisatie: invoer.organisatieId, detail: uitkomst.fout });
       return faalt("opzeggen_mislukt");
@@ -351,7 +365,7 @@ export function maakAbonnement(instelling: Instelling) {
   const misPogingen = new Map<string, number[]>();
 
   /** Zoekt de klant bij een ingevulde code, met alle controles. Een verkeerde code telt als poging. */
-  async function zoek(invoer: { organisatieId: string; namens?: string; code: unknown }, nu = Date.now()): Promise<GevondenKlant> {
+  async function zoek(invoer: Koppelinvoer, nu = Date.now()): Promise<GevondenKlant> {
     if (!koppelenKan()) return faalt("abonnementen_uit");
     const stand = await haalStand(invoer.organisatieId, invoer.namens ?? SYSTEEM);
     if (stand.soort !== "proef" && stand.soort !== "verlopen") return faalt("abonnement_loopt_koppelen");
@@ -373,12 +387,12 @@ export function maakAbonnement(instelling: Instelling) {
     }
     const gevonden = klant.waarde;
     if (!gevonden || !gevonden.tot || gevonden.tot.getTime() <= nu) return mis();
-    if (gevonden.app === instelling.app) return { ...faalt("koppelcode_zelfde_app"), fout: `Deze code is gemaakt in ${instelling.naam}. Gebruik hem in een andere app van Jona.` };
-    return { ok: true, klantId: gevonden.id, naam: gevonden.naam, email: gevonden.email, app: appNaam(gevonden.app) };
+    if (gevonden.app === instelling.app) return { ...faalt("koppelcode_zelfde_app"), fout: ZELFDE_APP[leesTaal(invoer.taal)](instelling.naam) };
+    return { ok: true, klantId: gevonden.id, naam: gevonden.naam, email: gevonden.email, app: appNaam(gevonden.app, leesTaal(invoer.taal)) };
   }
 
   /** De controlestap: bij welke klant hoort deze code? Er wordt nog niets gekoppeld. */
-  async function controleerKoppelcode(invoer: { organisatieId: string; namens?: string; code: unknown }): Promise<{ ok: true; naam: string | null; app: string } | Mislukt> {
+  async function controleerKoppelcode(invoer: Koppelinvoer): Promise<{ ok: true; naam: string | null; app: string } | Mislukt> {
     const uitkomst = await zoek(invoer);
     return uitkomst.ok ? { ok: true, naam: uitkomst.naam, app: uitkomst.app } : uitkomst;
   }
@@ -389,7 +403,7 @@ export function maakAbonnement(instelling: Instelling) {
    * niet, dan maakt app A een nieuwe code. Geeft de klant terug, zodat de app
    * de betaler een seintje kan mailen.
    */
-  async function bevestigKoppeling(invoer: { organisatieId: string; namens?: string; code: unknown }): Promise<GevondenKlant> {
+  async function bevestigKoppeling(invoer: Koppelinvoer): Promise<GevondenKlant> {
     const gevonden = await zoek(invoer);
     if (!gevonden.ok) return gevonden;
     const klantId = gevonden.klantId;

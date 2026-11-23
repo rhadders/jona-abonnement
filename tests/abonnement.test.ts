@@ -108,11 +108,21 @@ describe.each([
       expect(jaar.get("client_reference_id")).toBe(NIEUW);
       expect(jaar.get("subscription_data[metadata][organisatie_id]")).toBe(NIEUW);
       expect(jaar.get("subscription_data[description]")).toBe(`${naam} voor Stichting Voorbeeld`);
+      expect(jaar.get("locale")).toBe("nl");
       expect(jaar.get("customer_email")).toBe("pen@nieuw.test");
       expect(jaar.get("success_url")).toBe(`${herkomst}/abonnement?sessie={CHECKOUT_SESSION_ID}`);
       expect(jaar.get("cancel_url")).toBe(`${herkomst}/abonnement`);
       const proefEinde = Number(jaar.get("subscription_data[trial_end]")) * 1000;
       expect(Math.abs(proefEinde - (Date.now() + 14 * DAG))).toBeLessThan(60_000);
+    });
+
+    it("opent de betaalpagina in de taal van de klant", async () => {
+      expect((await abonnement.startAbonnement({ organisatieId: NIEUW, namens: GEBRUIKER, organisatieNaam: "Example Trust", email: "pen@nieuw.test", plan: "jaar", herkomst, taal: "en" })).ok).toBe(true);
+      expect(stripe.sessies.at(-1)!.get("locale")).toBe("en-GB");
+      expect(stripe.sessies.at(-1)!.get("subscription_data[description]")).toBe(`${naam} for Example Trust`);
+      expect((await abonnement.startAbonnement({ organisatieId: NIEUW, namens: GEBRUIKER, organisatieNaam: "Beispielverein", email: "pen@nieuw.test", plan: "jaar", herkomst, taal: "de" })).ok).toBe(true);
+      expect(stripe.sessies.at(-1)!.get("locale")).toBe("de");
+      expect(stripe.sessies.at(-1)!.get("subscription_data[description]")).toBe(`${naam} für Beispielverein`);
     });
 
     it("na de proef begint een abonnement direct", async () => {
@@ -157,6 +167,9 @@ describe.each([
       expect(stripe.eenmalig).toContain(`jona-${app}-portaal-2`);
       expect(stripe.portaalsessies.at(-1)!.get("configuration")).toBe(portaal.id);
       expect(stripe.portaalsessies.at(-1)!.get("flow_data[type]")).toBeNull();
+      expect(stripe.portaalsessies.at(-1)!.get("locale")).toBe("nl");
+      expect((await abonnement.openPortaal({ organisatieId: OUD, namens: GEBRUIKER, herkomst, taal: "de" })).ok).toBe(true);
+      expect(stripe.portaalsessies.at(-1)!.get("locale")).toBe("de");
       // Een tweede keer: het portaal wordt teruggevonden, niet opnieuw aangemaakt.
       abonnement.vergeet();
       expect((await abonnement.openPortaal({ organisatieId: OUD, namens: GEBRUIKER, herkomst })).ok).toBe(true);
@@ -318,6 +331,7 @@ describe.each([
       expect(gemaakt.ok).toBe(true);
       if (!gemaakt.ok) return;
       expect(await abonnement.controleerKoppelcode(hier(gemaakt.code))).toMatchObject({ ok: false, code: "koppelcode_zelfde_app", fout: expect.stringContaining(`gemaakt in ${naam}`) });
+      expect(await abonnement.controleerKoppelcode({ ...hier(gemaakt.code), taal: "en" })).toMatchObject({ ok: false, code: "koppelcode_zelfde_app", fout: `This code was created in ${naam}. Use it in another Jona app.` });
       await abonnement.trekKoppelcodeIn(appA);
     });
 
@@ -400,8 +414,9 @@ describe.each([
 
   describe("opzeggen, voor alleen het eigen abonnement", () => {
     it("opent Stripe in de flow voor opzeggen van alleen dit abonnement, met een eigen instelling", async () => {
-      expect(await abonnement.openOpzeggen({ organisatieId: ANDER, namens: GEBRUIKER, herkomst })).toEqual({ ok: true, adres: "https://billing.stripe.com/p/session/cus_ander00001" });
+      expect(await abonnement.openOpzeggen({ organisatieId: ANDER, namens: GEBRUIKER, herkomst, taal: "en" })).toEqual({ ok: true, adres: "https://billing.stripe.com/p/session/cus_ander00001" });
       const sessie = stripe.portaalsessies.at(-1)!;
+      expect(sessie.get("locale")).toBe("en-GB");
       expect(sessie.get("flow_data[type]")).toBe("subscription_cancel");
       expect(sessie.get("flow_data[subscription_cancel][subscription]")).toBe("sub_ander00001");
       expect(sessie.get("flow_data[after_completion][type]")).toBe("redirect");
